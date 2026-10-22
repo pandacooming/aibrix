@@ -51,10 +51,13 @@ import (
 )
 
 type simConfig struct {
-	Pods          int
-	Gateways      int
-	Utilization   float64
-	MeanWork      float64 // output tokens per request
+	Pods        int
+	Gateways    int
+	Utilization float64
+	MeanWork    float64 // output tokens per request
+	// HeavyTail draws 10% of requests with a mean of 5.5x MeanWork and the rest with 0.5x, keeping
+	// the overall mean; otherwise request work is exponential.
+	HeavyTail     bool
 	PrefixOn      bool
 	PrefixGroups  int
 	PrefixPerPod  int     // prefix groups a pod keeps cached (LRU)
@@ -85,9 +88,18 @@ type policy struct {
 	Kind            policyKind
 	K               int
 	SnapshotRefresh time.Duration
+	// LiveScoring scores the candidates with exact running counts, as a gateway would after
+	// reading only the candidates' counts from Redis. Candidate selection and the imbalance
+	// gate still use the delayed counts.
+	LiveScoring bool
 }
 
 func (p policy) String() string {
+	if p.LiveScoring {
+		q := p
+		q.LiveScoring = false
+		return q.String() + ", live stage 2"
+	}
 	switch p.Kind {
 	case policyFull:
 		return "full"
@@ -177,6 +189,7 @@ type sim struct {
 	latencies      []float64
 	agree, decided int
 	gated          int
+	exact          bool // observed returns exact counts (stage-2 live scoring)
 	hits           int
 	scored         int
 	loadRatioSum   float64
@@ -202,7 +215,7 @@ func newSim(cfg simConfig, pol policy) *sim {
 
 // observed is the running count gateway g believes pod i has.
 func (s *sim) observed(g, i int) int {
-	if s.cfg.SignalDelay == 0 {
+	if s.cfg.SignalDelay == 0 || s.exact {
 		return len(s.pods[i].running)
 	}
 	return s.refTotal[g][i] - s.refLocal[g][i] + s.local[g][i]
@@ -391,6 +404,8 @@ func (s *sim) route(r *request, group int) {
 		}
 	}
 	cand := s.candidates(g, group, universe, allowed)
+	s.exact = s.pol.LiveScoring
+	defer func() { s.exact = false }()
 	target := s.argmax(cand, s.finalScores(g, group, cand))
 	if s.pol.Kind == policyFull {
 		s.agree++
@@ -439,6 +454,16 @@ func (s *sim) place(r *request, target, group int) {
 	s.local[r.gateway][target]++
 }
 
+func (s *sim) work() float64 {
+	if s.cfg.HeavyTail && s.rng.Float64() < 0.1 {
+		return s.rng.ExpFloat64() * 5.5 * s.cfg.MeanWork
+	}
+	if s.cfg.HeavyTail {
+		return s.rng.ExpFloat64() * 0.5 * s.cfg.MeanWork
+	}
+	return s.rng.ExpFloat64() * s.cfg.MeanWork
+}
+
 func (s *sim) run() result {
 	cfg := s.cfg
 	totalCap := 0.0
@@ -468,7 +493,7 @@ func (s *sim) run() result {
 			s.nextSnapshot += s.pol.SnapshotRefresh.Seconds()
 		}
 		for nextArrival < s.now+dt {
-			r := &request{arrival: nextArrival, remaining: s.rng.ExpFloat64() * cfg.MeanWork, gateway: gw}
+			r := &request{arrival: nextArrival, remaining: s.work(), gateway: gw}
 			gw = (gw + 1) % cfg.Gateways
 			group := int(s.zipf.Uint64())
 			if s.now < cfg.Warmup.Seconds() {
@@ -580,6 +605,214 @@ func TestCandidateSelectionQuality(t *testing.T) {
 				fmt.Fprintf(&out, "| %s | %.1f%% | %.3f | %.3f | %.2f | %s | %.1f%% | %.0f |\n",
 					res.Policy, 100*res.Agreement, res.MeanLatency, res.P99Latency, res.MaxToMeanLoad, hit, 100*res.Gated, res.ScoredPerReq)
 			}
+		}
+	}
+	t.Log(out.String())
+	if path := os.Getenv("CANDIDATE_SIM_OUT"); path != "" {
+		if err := os.WriteFile(path, []byte(out.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestCandidateSelectionRobustness reruns the main policies across seeds, a larger fleet and
+// heavy-tailed request sizes, and reports each policy's mean latency relative to full scoring on
+// the same seed. Run it with CANDIDATE_SIM=robust; it takes tens of minutes.
+func TestCandidateSelectionRobustness(t *testing.T) {
+	if os.Getenv("CANDIDATE_SIM") != "robust" {
+		t.Skip("set CANDIDATE_SIM=robust to run the robustness sweep")
+	}
+	policies := []policy{
+		{Kind: policyFull},
+		{Kind: policyRandomSeeded, K: 16},
+		{Kind: policyCountIndex, K: 16},
+		{Kind: policyCountIndexMixed, K: 16},
+		{Kind: policySnapshot, K: 16, SnapshotRefresh: 50 * time.Millisecond},
+	}
+	type variant struct {
+		name      string
+		pods      int
+		heavyTail bool
+		seeds     []uint64
+		duration  time.Duration
+	}
+	variants := []variant{
+		{"N=500, exponential sizes, 5 seeds", 500, false, []uint64{1, 2, 3, 4, 5}, 25 * time.Second},
+		{"N=500, heavy-tailed sizes, 3 seeds", 500, true, []uint64{1, 2, 3}, 25 * time.Second},
+		{"N=2000, exponential sizes, 1 seed", 2000, false, []uint64{1}, 13 * time.Second},
+	}
+	type scenario struct {
+		prefixOn bool
+		delay    time.Duration
+	}
+	var scenarios []scenario
+	for _, prefixOn := range []bool{false, true} {
+		for _, delay := range []time.Duration{0, 100 * time.Millisecond, time.Second} {
+			scenarios = append(scenarios, scenario{prefixOn, delay})
+		}
+	}
+
+	var out strings.Builder
+	for _, v := range variants {
+		// results[scenario][seed][policy]
+		results := make([][][]result, len(scenarios))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 4)
+		for si, sc := range scenarios {
+			results[si] = make([][]result, len(v.seeds))
+			for ki, seed := range v.seeds {
+				results[si][ki] = make([]result, len(policies))
+				for pi, pol := range policies {
+					cfg := simConfig{
+						Pods: v.pods, Gateways: 4, Utilization: 0.85, MeanWork: 200, HeavyTail: v.heavyTail,
+						PrefixOn: sc.prefixOn, PrefixGroups: 2000, PrefixPerPod: 32, PrefixSaving: 0.3,
+						SignalDelay: sc.delay, Step: 5 * time.Millisecond,
+						Warmup: 3 * time.Second, Duration: v.duration,
+						PrefixSeedMax: 4, Seed: seed,
+						ImbalanceMinGap: 8, ImbalanceFactor: 2,
+					}
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						results[si][ki][pi] = newSim(cfg, pol).run()
+					}()
+				}
+			}
+		}
+		wg.Wait()
+
+		fmt.Fprintf(&out, "\n### %s\n\n", v.name)
+		out.WriteString("Mean latency relative to full scoring on the same seed: mean (min to max). Full scoring's own mean latency in seconds in the first row; prefix hit ratio after the slash when prefix caching is on.\n\n")
+		out.WriteString("| Policy |")
+		for _, sc := range scenarios {
+			fmt.Fprintf(&out, " prefix=%v delay=%v |", sc.prefixOn, sc.delay)
+		}
+		out.WriteString("\n| --- |" + strings.Repeat(" --- |", len(scenarios)) + "\n")
+		for pi, pol := range policies {
+			fmt.Fprintf(&out, "| %s |", pol)
+			for si, sc := range scenarios {
+				var sum, lo, hi, hit float64
+				lo = math.Inf(1)
+				for ki := range v.seeds {
+					r := results[si][ki][pi]
+					x := r.MeanLatency
+					if pi > 0 {
+						x /= results[si][ki][0].MeanLatency
+					}
+					sum += x
+					lo, hi = math.Min(lo, x), math.Max(hi, x)
+					hit += r.PrefixHit
+				}
+				n := float64(len(v.seeds))
+				cell := fmt.Sprintf("%.3f s", sum/n)
+				if pi > 0 {
+					cell = fmt.Sprintf("%.2f", sum/n)
+					if len(v.seeds) > 1 {
+						cell += fmt.Sprintf(" (%.2f to %.2f)", lo, hi)
+					}
+				}
+				if sc.prefixOn {
+					cell += fmt.Sprintf(" / %.1f%%", 100*hit/n)
+				}
+				fmt.Fprintf(&out, " %s |", cell)
+			}
+			out.WriteString("\n")
+		}
+	}
+	t.Log(out.String())
+	if path := os.Getenv("CANDIDATE_SIM_OUT"); path != "" {
+		if err := os.WriteFile(path, []byte(out.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestCandidateSelectionLiveStage2 compares today's design, full scoring on exact counts read
+// from Redis for every pod on every request, with a candidate stage whose index is refreshed
+// from Redis only every SignalDelay and which then reads exact counts for its candidates. Run it
+// with CANDIDATE_SIM=live.
+func TestCandidateSelectionLiveStage2(t *testing.T) {
+	if os.Getenv("CANDIDATE_SIM") != "live" {
+		t.Skip("set CANDIDATE_SIM=live to run the live stage-2 comparison")
+	}
+	policies := []policy{
+		{Kind: policyRandomSeeded, K: 16, LiveScoring: true},
+		{Kind: policyCountIndex, K: 16, LiveScoring: true},
+		{Kind: policyCountIndexMixed, K: 16, LiveScoring: true},
+		{Kind: policyCountIndex, K: 16},
+	}
+	seeds := []uint64{1, 2, 3}
+	var out strings.Builder
+	out.WriteString("Mean latency relative to full scoring on exact counts (today with Redis), same seed: mean (min to max). Prefix hit ratio after the slash.\n\n")
+	out.WriteString("| Policy | Index refresh | Prefix off | Prefix on |\n| --- | --- | --- | --- |\n")
+	base := func(prefixOn bool, delay time.Duration, seed uint64) simConfig {
+		return simConfig{
+			Pods: 500, Gateways: 4, Utilization: 0.85, MeanWork: 200,
+			PrefixOn: prefixOn, PrefixGroups: 2000, PrefixPerPod: 32, PrefixSaving: 0.3,
+			SignalDelay: delay, Step: 5 * time.Millisecond,
+			Warmup: 3 * time.Second, Duration: 25 * time.Second,
+			PrefixSeedMax: 4, Seed: seed,
+			ImbalanceMinGap: 8, ImbalanceFactor: 2,
+		}
+	}
+	full := map[[2]int]result{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	run := func(cfg simConfig, pol policy, store func(result)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			r := newSim(cfg, pol).run()
+			mu.Lock()
+			store(r)
+			mu.Unlock()
+		}()
+	}
+	for pi, prefixOn := range []bool{false, true} {
+		for ki, seed := range seeds {
+			run(base(prefixOn, 0, seed), policy{Kind: policyFull}, func(r result) { full[[2]int{pi, ki}] = r })
+		}
+	}
+	delays := []time.Duration{100 * time.Millisecond, time.Second}
+	got := map[[4]int]result{}
+	for di, delay := range delays {
+		for poi, pol := range policies {
+			for pi, prefixOn := range []bool{false, true} {
+				for ki, seed := range seeds {
+					run(base(prefixOn, delay, seed), pol, func(r result) { got[[4]int{di, poi, pi, ki}] = r })
+				}
+			}
+		}
+	}
+	wg.Wait()
+	fmt.Fprintf(&out, "| full, exact counts | every request | %.3f s | %.3f s / %.1f%% |\n",
+		full[[2]int{0, 0}].MeanLatency, full[[2]int{1, 0}].MeanLatency, 100*full[[2]int{1, 0}].PrefixHit)
+	for di, delay := range delays {
+		for poi, pol := range policies {
+			fmt.Fprintf(&out, "| %s | %v |", pol, delay)
+			for pi := range []bool{false, true} {
+				var sum, hit float64
+				lo, hi := math.Inf(1), math.Inf(-1)
+				for ki := range seeds {
+					r := got[[4]int{di, poi, pi, ki}]
+					x := r.MeanLatency / full[[2]int{pi, ki}].MeanLatency
+					sum += x
+					lo, hi = math.Min(lo, x), math.Max(hi, x)
+					hit += r.PrefixHit
+				}
+				n := float64(len(seeds))
+				cell := fmt.Sprintf("%.2f (%.2f to %.2f)", sum/n, lo, hi)
+				if pi == 1 {
+					cell += fmt.Sprintf(" / %.1f%%", 100*hit/n)
+				}
+				fmt.Fprintf(&out, " %s |", cell)
+			}
+			out.WriteString("\n")
 		}
 	}
 	t.Log(out.String())

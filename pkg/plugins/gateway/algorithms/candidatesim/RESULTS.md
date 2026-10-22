@@ -1,5 +1,7 @@
 # Candidate-selection simulation results
 
+## Main comparison (seed 42)
+
 Output of `CANDIDATE_SIM=1 go test -run TestCandidateSelectionQuality ./pkg/plugins/gateway/algorithms/candidatesim/` (seed 42). See the package comment in sim_test.go for the model.
 
 ### prefix=false signal delay=0s (N=500, 4 gateways, utilization 0.85)
@@ -97,3 +99,61 @@ Output of `CANDIDATE_SIM=1 go test -run TestCandidateSelectionQuality ./pkg/plug
 | D snapshot K=8 T=50ms | 97.4% | 0.315 | 1.312 | 2.79 | 81.7% | 78.1% | 9 |
 | D snapshot K=16 T=50ms | 97.6% | 0.323 | 1.328 | 2.77 | 81.7% | 76.5% | 16 |
 | D snapshot K=32 T=50ms | 98.1% | 0.323 | 1.381 | 2.99 | 84.0% | 64.8% | 28 |
+
+## Robustness sweep
+
+Output of `CANDIDATE_SIM=robust go test -run TestCandidateSelectionRobustness ...`.
+
+### N=500, exponential sizes, 5 seeds
+
+Mean latency relative to full scoring on the same seed: mean (min to max). Full scoring's own mean latency in seconds in the first row; prefix hit ratio after the slash when prefix caching is on.
+
+| Policy | prefix=false delay=0s | prefix=false delay=100ms | prefix=false delay=1s | prefix=true delay=0s | prefix=true delay=100ms | prefix=true delay=1s |
+| --- | --- | --- | --- | --- | --- | --- |
+| full | 0.051 s | 0.101 s | 0.523 s | 0.041 s / 99.7% | 0.072 s / 94.8% | 0.316 s / 83.2% |
+| A random+prefix K=16 | 1.06 (1.05 to 1.07) | 1.08 (1.06 to 1.08) | 1.03 (1.00 to 1.06) | 0.98 (0.95 to 1.00) / 99.4% | 1.00 (0.98 to 1.00) / 95.8% | 0.97 (0.93 to 1.03) / 83.0% |
+| C count index K=16 | 0.88 (0.87 to 0.88) | 0.92 (0.91 to 0.93) | 1.14 (1.07 to 1.18) | 0.83 (0.82 to 0.84) / 98.0% | 0.99 (0.97 to 0.99) / 94.7% | 0.98 (0.94 to 1.02) / 83.6% |
+| C+A index K/2 + random K/2, K=16 | 0.90 (0.89 to 0.91) | 0.93 (0.92 to 0.94) | 1.03 (0.98 to 1.07) | 0.94 (0.91 to 0.96) / 99.0% | 1.00 (0.98 to 1.00) / 95.8% | 0.98 (0.95 to 1.03) / 83.4% |
+| D snapshot K=16 T=50ms | 1.42 (1.40 to 1.44) | 1.16 (1.13 to 1.19) | 1.03 (1.01 to 1.07) | 0.94 (0.92 to 0.98) / 97.9% | 1.00 (1.00 to 1.01) / 94.6% | 1.00 (0.97 to 1.04) / 81.3% |
+
+### N=500, heavy-tailed sizes, 3 seeds
+
+Mean latency relative to full scoring on the same seed: mean (min to max). Full scoring's own mean latency in seconds in the first row; prefix hit ratio after the slash when prefix caching is on.
+
+| Policy | prefix=false delay=0s | prefix=false delay=100ms | prefix=false delay=1s | prefix=true delay=0s | prefix=true delay=100ms | prefix=true delay=1s |
+| --- | --- | --- | --- | --- | --- | --- |
+| full | 0.050 s | 0.082 s | 0.230 s | 0.041 s / 99.7% | 0.059 s / 96.9% | 0.142 s / 84.1% |
+| A random+prefix K=16 | 1.07 (1.04 to 1.09) | 1.08 (1.08 to 1.09) | 1.01 (0.98 to 1.04) | 0.95 (0.88 to 1.00) / 99.4% | 0.99 (0.99 to 1.00) / 97.9% | 1.07 (0.98 to 1.13) / 81.0% |
+| C count index K=16 | 0.89 (0.88 to 0.91) | 0.91 (0.90 to 0.92) | 1.01 (0.97 to 1.07) | 0.81 (0.78 to 0.82) / 97.9% | 0.99 (0.98 to 0.99) / 96.3% | 1.03 (0.99 to 1.07) / 83.3% |
+| C+A index K/2 + random K/2, K=16 | 0.91 (0.90 to 0.93) | 0.94 (0.93 to 0.94) | 1.00 (0.99 to 1.01) | 0.92 (0.90 to 0.93) / 98.8% | 1.00 (1.00 to 1.00) / 97.5% | 1.06 (1.02 to 1.12) / 81.4% |
+| D snapshot K=16 T=50ms | 1.35 (1.33 to 1.37) | 1.23 (1.22 to 1.25) | 1.08 (1.07 to 1.10) | 0.95 (0.92 to 0.97) / 97.6% | 1.01 (1.01 to 1.02) / 95.7% | 1.05 (1.03 to 1.09) / 81.4% |
+
+### N=2000, exponential sizes, 1 seed
+
+Mean latency relative to full scoring on the same seed: mean (min to max). Full scoring's own mean latency in seconds in the first row; prefix hit ratio after the slash when prefix caching is on.
+
+| Policy | prefix=false delay=0s | prefix=false delay=100ms | prefix=false delay=1s | prefix=true delay=0s | prefix=true delay=100ms | prefix=true delay=1s |
+| --- | --- | --- | --- | --- | --- | --- |
+| full | 0.051 s | 0.099 s | 0.478 s | 0.036 s / 99.6% | 0.070 s / 94.5% | 0.300 s / 88.3% |
+| A random+prefix K=16 | 1.05 | 1.05 | 1.00 | 1.00 / 99.7% | 0.99 / 96.6% | 1.02 / 88.2% |
+| C count index K=16 | 0.87 | 0.88 | 1.03 | 0.90 / 98.8% | 0.98 / 95.9% | 1.00 / 88.1% |
+| C+A index K/2 + random K/2, K=16 | 0.89 | 0.91 | 1.04 | 1.00 / 99.4% | 0.98 / 96.9% | 0.98 / 87.7% |
+| D snapshot K=16 T=50ms | 1.16 | 0.96 | 1.06 | 1.09 / 98.8% | 1.00 / 95.0% | 1.02 / 87.9% |
+
+## Live stage 2
+
+Output of `CANDIDATE_SIM=live go test -run TestCandidateSelectionLiveStage2 ...`: the index is refreshed every "Index refresh" (plus this gateway's own picks live), and the candidates are scored with exact counts, as a gateway that reads only the candidates from Redis would.
+
+Mean latency relative to full scoring on exact counts (today with Redis), same seed: mean (min to max). Prefix hit ratio after the slash.
+
+| Policy | Index refresh | Prefix off | Prefix on |
+| --- | --- | --- | --- |
+| full, exact counts | every request | 0.051 s | 0.040 s / 99.6% |
+| A random+prefix K=16, live stage 2 | 100ms | 1.06 (1.06 to 1.07) | 1.08 (1.05 to 1.10) / 99.5% |
+| C count index K=16, live stage 2 | 100ms | 1.01 (1.00 to 1.02) | 1.06 (1.04 to 1.09) / 99.1% |
+| C+A index K/2 + random K/2, K=16, live stage 2 | 100ms | 1.00 (0.99 to 1.01) | 1.07 (1.03 to 1.11) / 99.4% |
+| C count index K=16 | 100ms | 1.85 (1.85 to 1.86) | 1.74 (1.71 to 1.77) / 94.6% |
+| A random+prefix K=16, live stage 2 | 1s | 1.06 (1.06 to 1.07) | 1.02 (0.98 to 1.10) / 99.5% |
+| C count index K=16, live stage 2 | 1s | 8.77 (8.31 to 9.13) | 6.43 (6.25 to 6.55) / 84.3% |
+| C+A index K/2 + random K/2, K=16, live stage 2 | 1s | 1.03 (1.02 to 1.04) | 1.36 (1.03 to 2.02) / 97.3% |
+| C count index K=16 | 1s | 11.73 (11.48 to 12.21) | 7.61 (7.47 to 7.82) / 83.8% |
