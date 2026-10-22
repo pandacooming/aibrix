@@ -1,0 +1,591 @@
+/*
+Copyright 2026 The Aibrix Team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package candidatesim compares candidate-selection policies for gateway routing (RFC #3188)
+// against full scoring in a discrete-time simulation. It holds only tests: run it with
+//
+//	CANDIDATE_SIM=1 go test -run TestCandidateSelectionQuality -v ./pkg/plugins/gateway/algorithms/candidatesim/
+//
+// The model, deliberately simple:
+//   - Pods have heterogeneous capacity (output tokens/s) and serve their running requests by
+//     processor sharing.
+//   - Several gateways route round-robin arrivals. Each sees its own picks live and the other
+//     gateways' load only as of the last refresh, every SignalDelay (0 = always exact).
+//   - The load score mirrors load-balance: running / capacity, lower is better.
+//   - Before any scoring, the gateway's load-imbalance gate runs on the counts the gateway
+//     observes: when max-min >= ImbalanceMinGap and max > ImbalanceFactor*(mean of the others+1),
+//     only the pods at the minimum count stay eligible (ApplyLoadImbalanceGate). Every policy
+//     picks its candidates from the pods the gate leaves.
+//   - With prefix caching on, each request belongs to a Zipf-distributed prefix group. A pod
+//     holding the group's prefix serves the request with less work, and the blend adds an
+//     equal-weight prefix term after min-max normalizing load over the scored pods, as
+//     multiStrategyRouter does.
+//
+// For every request the simulation also computes what full scoring would have chosen on the
+// same state, so "agreement" isolates the candidate stage's effect on each decision.
+package candidatesim
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+type simConfig struct {
+	Pods          int
+	Gateways      int
+	Utilization   float64
+	MeanWork      float64 // output tokens per request
+	PrefixOn      bool
+	PrefixGroups  int
+	PrefixPerPod  int     // prefix groups a pod keeps cached (LRU)
+	PrefixSaving  float64 // fraction of work saved on a prefix hit
+	SignalDelay   time.Duration
+	Step          time.Duration
+	Warmup        time.Duration
+	Duration      time.Duration
+	PrefixSeedMax int // M: prefix holders added to the candidate set
+	// Load-imbalance gate, as AIBRIX_LOAD_BALANCE_IMBALANCE_MIN_GAP and _FACTOR. MinGap 0 disables it.
+	ImbalanceMinGap int
+	ImbalanceFactor float64
+	Seed            uint64
+}
+
+type policyKind int
+
+const (
+	policyFull policyKind = iota
+	policyRandom
+	policyRandomSeeded
+	policySnapshot
+	policyCountIndex
+	policyCountIndexMixed
+)
+
+type policy struct {
+	Kind            policyKind
+	K               int
+	SnapshotRefresh time.Duration
+}
+
+func (p policy) String() string {
+	switch p.Kind {
+	case policyFull:
+		return "full"
+	case policyRandom:
+		return fmt.Sprintf("A random K=%d", p.K)
+	case policyRandomSeeded:
+		return fmt.Sprintf("A random+prefix K=%d", p.K)
+	case policySnapshot:
+		return fmt.Sprintf("D snapshot K=%d T=%v", p.K, p.SnapshotRefresh)
+	case policyCountIndex:
+		return fmt.Sprintf("C count index K=%d", p.K)
+	case policyCountIndexMixed:
+		return fmt.Sprintf("C+A index K/2 + random K/2, K=%d", p.K)
+	}
+	return "unknown"
+}
+
+type request struct {
+	arrival   float64
+	remaining float64
+	gateway   int
+	pod       int
+}
+
+type pod struct {
+	capacity float64
+	running  []*request
+	groups   []int // cached prefix groups, most recent last
+}
+
+func (p *pod) holds(group int) bool {
+	for _, g := range p.groups {
+		if g == group {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *pod) touch(group, limit int) {
+	for i, g := range p.groups {
+		if g == group {
+			copy(p.groups[i:], p.groups[i+1:])
+			p.groups[len(p.groups)-1] = group
+			return
+		}
+	}
+	if len(p.groups) == limit {
+		copy(p.groups, p.groups[1:])
+		p.groups = p.groups[:limit-1]
+	}
+	p.groups = append(p.groups, group)
+}
+
+type result struct {
+	Policy        string
+	Requests      int
+	Agreement     float64 // share of decisions as good as full scoring's
+	Gated         float64 // share of decisions the imbalance gate restricted
+	MeanLatency   float64 // seconds
+	P99Latency    float64 // seconds
+	PrefixHit     float64
+	ScoredPerReq  float64
+	MaxToMeanLoad float64 // time-averaged max/mean running across pods
+}
+
+type sim struct {
+	cfg    simConfig
+	pol    policy
+	rng    *rand.Rand
+	pods   []*pod
+	now    float64
+	zipf   *rand.Zipf
+	holder map[int][]int // prefix group -> pods holding it
+
+	// Per gateway: running requests it routed per pod (live), and the total running per pod
+	// and its own share as of the last refresh.
+	local       [][]int
+	refTotal    [][]int
+	refLocal    [][]int
+	nextRefresh float64
+
+	// Per gateway ranking snapshot for policySnapshot.
+	snapshot     [][]int
+	nextSnapshot float64
+
+	latencies      []float64
+	agree, decided int
+	gated          int
+	hits           int
+	scored         int
+	loadRatioSum   float64
+	loadRatioN     int
+}
+
+func newSim(cfg simConfig, pol policy) *sim {
+	s := &sim{cfg: cfg, pol: pol, rng: rand.New(rand.NewPCG(cfg.Seed, 7))}
+	caps := []float64{3000, 4000, 6000}
+	for i := 0; i < cfg.Pods; i++ {
+		s.pods = append(s.pods, &pod{capacity: caps[i%len(caps)]})
+	}
+	s.zipf = rand.NewZipf(s.rng, 1.1, 1, uint64(cfg.PrefixGroups-1))
+	s.holder = map[int][]int{}
+	for g := 0; g < cfg.Gateways; g++ {
+		s.local = append(s.local, make([]int, cfg.Pods))
+		s.refTotal = append(s.refTotal, make([]int, cfg.Pods))
+		s.refLocal = append(s.refLocal, make([]int, cfg.Pods))
+		s.snapshot = append(s.snapshot, nil)
+	}
+	return s
+}
+
+// observed is the running count gateway g believes pod i has.
+func (s *sim) observed(g, i int) int {
+	if s.cfg.SignalDelay == 0 {
+		return len(s.pods[i].running)
+	}
+	return s.refTotal[g][i] - s.refLocal[g][i] + s.local[g][i]
+}
+
+func (s *sim) loadScore(g, i int) float64 {
+	return float64(s.observed(g, i)+1) / s.pods[i].capacity
+}
+
+func (s *sim) refreshSignals() {
+	for g := range s.local {
+		for i, p := range s.pods {
+			s.refTotal[g][i] = len(p.running)
+			s.refLocal[g][i] = s.local[g][i]
+		}
+	}
+}
+
+func (s *sim) refreshSnapshots() {
+	for g := range s.snapshot {
+		order := make([]int, len(s.pods))
+		for i := range order {
+			order[i] = i
+		}
+		s.rng.Shuffle(len(order), func(a, b int) { order[a], order[b] = order[b], order[a] })
+		sort.SliceStable(order, func(a, b int) bool { return s.loadScore(g, order[a]) < s.loadScore(g, order[b]) })
+		s.snapshot[g] = order
+	}
+}
+
+// finalScores returns the blended score (higher is better) of each pod in set, normalizing load
+// over the set itself as the router does.
+func (s *sim) finalScores(g, group int, set []int) []float64 {
+	scores := make([]float64, len(set))
+	lo, hi := math.Inf(1), math.Inf(-1)
+	for j, i := range set {
+		l := s.loadScore(g, i)
+		scores[j] = l
+		lo, hi = math.Min(lo, l), math.Max(hi, l)
+	}
+	for j, i := range set {
+		norm := 1.0
+		if hi > lo {
+			norm = 1 - (scores[j]-lo)/(hi-lo)
+		}
+		if s.cfg.PrefixOn {
+			prefix := 0.0
+			if s.pods[i].holds(group) {
+				prefix = 1
+			}
+			scores[j] = 0.5*norm + 0.5*prefix
+		} else {
+			scores[j] = norm
+		}
+	}
+	return scores
+}
+
+func (s *sim) argmax(set []int, scores []float64) int {
+	best, bestScore, ties := -1, math.Inf(-1), 0
+	for j, i := range set {
+		switch {
+		case scores[j] > bestScore+1e-12:
+			best, bestScore, ties = i, scores[j], 1
+		case math.Abs(scores[j]-bestScore) <= 1e-12:
+			ties++
+			if s.rng.IntN(ties) == 0 {
+				best = i
+			}
+		}
+	}
+	return best
+}
+
+// eligible applies the load-imbalance gate to the counts gateway g observes and returns the
+// pods left, or nil when the gate does not fire (every pod stays eligible).
+func (s *sim) eligible(g int) []int {
+	if s.cfg.ImbalanceMinGap == 0 {
+		return nil
+	}
+	lo, hi, sum := math.MaxInt, 0, 0
+	for i := range s.pods {
+		v := s.observed(g, i)
+		lo, hi, sum = min(lo, v), max(hi, v), sum+v
+	}
+	if hi-lo < s.cfg.ImbalanceMinGap {
+		return nil
+	}
+	if n := len(s.pods); n > 2 && float64(hi) <= s.cfg.ImbalanceFactor*(float64(sum-hi)/float64(n-1)+1) {
+		return nil
+	}
+	var out []int
+	for i := range s.pods {
+		if s.observed(g, i) == lo {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+func (s *sim) prefixSeeds(g, group int, allowed map[int]bool) []int {
+	if !s.cfg.PrefixOn || s.cfg.PrefixSeedMax == 0 {
+		return nil
+	}
+	var holders []int
+	for _, h := range s.holder[group] {
+		if allowed == nil || allowed[h] {
+			holders = append(holders, h)
+		}
+	}
+	sort.Slice(holders, func(a, b int) bool { return s.loadScore(g, holders[a]) < s.loadScore(g, holders[b]) })
+	if len(holders) > s.cfg.PrefixSeedMax {
+		holders = holders[:s.cfg.PrefixSeedMax]
+	}
+	return holders
+}
+
+func union(a, b []int) []int {
+	seen := make(map[int]struct{}, len(a)+len(b))
+	out := make([]int, 0, len(a)+len(b))
+	for _, list := range [][]int{a, b} {
+		for _, i := range list {
+			if _, ok := seen[i]; !ok {
+				seen[i] = struct{}{}
+				out = append(out, i)
+			}
+		}
+	}
+	return out
+}
+
+// candidates returns the pods the policy scores, drawn from universe (the pods the gate left).
+func (s *sim) candidates(g, group int, universe []int, allowed map[int]bool) []int {
+	n := len(universe)
+	k := min(s.pol.K, n)
+	switch s.pol.Kind {
+	case policyRandom, policyRandomSeeded:
+		perm := s.rng.Perm(n)[:k]
+		for j, idx := range perm {
+			perm[j] = universe[idx]
+		}
+		if s.pol.Kind == policyRandomSeeded {
+			return union(s.prefixSeeds(g, group, allowed), perm)
+		}
+		return perm
+	case policySnapshot:
+		picked := make([]int, 0, k)
+		for _, i := range s.snapshot[g] {
+			if len(picked) == k {
+				break
+			}
+			if allowed == nil || allowed[i] {
+				picked = append(picked, i)
+			}
+		}
+		return union(s.prefixSeeds(g, group, allowed), picked)
+	case policyCountIndex, policyCountIndexMixed:
+		order := append([]int(nil), universe...)
+		s.rng.Shuffle(n, func(a, b int) { order[a], order[b] = order[b], order[a] })
+		sort.SliceStable(order, func(a, b int) bool { return s.observed(g, order[a]) < s.observed(g, order[b]) })
+		if s.pol.Kind == policyCountIndexMixed {
+			// Half the slots from the index, half drawn uniformly from the rest, so stale counts
+			// cannot steer every candidate to the same few pods.
+			rest := order[min(s.pol.K/2, n):]
+			s.rng.Shuffle(len(rest), func(a, b int) { rest[a], rest[b] = rest[b], rest[a] })
+		}
+		return union(s.prefixSeeds(g, group, allowed), order[:k])
+	}
+	return universe
+}
+
+func (s *sim) route(r *request, group int) {
+	g := r.gateway
+	universe := s.eligible(g)
+	var allowed map[int]bool
+	if universe != nil {
+		s.gated++
+		allowed = make(map[int]bool, len(universe))
+		for _, i := range universe {
+			allowed[i] = true
+		}
+	} else {
+		universe = make([]int, len(s.pods))
+		for i := range universe {
+			universe[i] = i
+		}
+	}
+	cand := s.candidates(g, group, universe, allowed)
+	target := s.argmax(cand, s.finalScores(g, group, cand))
+	if s.pol.Kind == policyFull {
+		s.agree++
+	} else {
+		// Full scoring normalizes over every eligible pod, so compare on that scale.
+		fullScores := s.finalScores(g, group, universe)
+		pos := make(map[int]int, len(universe))
+		for j, i := range universe {
+			pos[i] = j
+		}
+		best := s.argmax(universe, fullScores)
+		if fullScores[pos[target]] >= fullScores[pos[best]]-1e-9 {
+			s.agree++
+		}
+	}
+	s.decided++
+	s.scored += len(cand)
+	s.place(r, target, group)
+}
+
+func (s *sim) place(r *request, target, group int) {
+	p := s.pods[target]
+	r.pod = target
+	if s.cfg.PrefixOn {
+		if p.holds(group) {
+			r.remaining *= 1 - s.cfg.PrefixSaving
+			if s.now >= s.cfg.Warmup.Seconds() {
+				s.hits++
+			}
+		} else {
+			if len(p.groups) == s.cfg.PrefixPerPod {
+				evicted := p.groups[0]
+				hs := s.holder[evicted]
+				for k, h := range hs {
+					if h == target {
+						s.holder[evicted] = append(hs[:k], hs[k+1:]...)
+						break
+					}
+				}
+			}
+			s.holder[group] = append(s.holder[group], target)
+		}
+		p.touch(group, s.cfg.PrefixPerPod)
+	}
+	p.running = append(p.running, r)
+	s.local[r.gateway][target]++
+}
+
+func (s *sim) run() result {
+	cfg := s.cfg
+	totalCap := 0.0
+	for _, p := range s.pods {
+		totalCap += p.capacity
+	}
+	work := cfg.MeanWork
+	if cfg.PrefixOn {
+		work *= 1 - cfg.PrefixSaving*0.5 // roughly half the requests hit
+	}
+	rate := cfg.Utilization * totalCap / work
+	dt := cfg.Step.Seconds()
+	end := cfg.Duration.Seconds()
+	nextArrival := s.rng.ExpFloat64() / rate
+	gw := 0
+	if s.pol.Kind == policySnapshot {
+		s.refreshSnapshots()
+		s.nextSnapshot = s.pol.SnapshotRefresh.Seconds()
+	}
+	for s.now = 0; s.now < end; s.now += dt {
+		if cfg.SignalDelay > 0 && s.now >= s.nextRefresh {
+			s.refreshSignals()
+			s.nextRefresh += cfg.SignalDelay.Seconds()
+		}
+		if s.pol.Kind == policySnapshot && s.now >= s.nextSnapshot {
+			s.refreshSnapshots()
+			s.nextSnapshot += s.pol.SnapshotRefresh.Seconds()
+		}
+		for nextArrival < s.now+dt {
+			r := &request{arrival: nextArrival, remaining: s.rng.ExpFloat64() * cfg.MeanWork, gateway: gw}
+			gw = (gw + 1) % cfg.Gateways
+			group := int(s.zipf.Uint64())
+			if s.now < cfg.Warmup.Seconds() {
+				// Warm-up decisions shape the state but are not counted.
+				agree, decided, scored, gated := s.agree, s.decided, s.scored, s.gated
+				s.route(r, group)
+				s.agree, s.decided, s.scored, s.gated = agree, decided, scored, gated
+			} else {
+				s.route(r, group)
+			}
+			nextArrival += s.rng.ExpFloat64() / rate
+		}
+		maxRun, sumRun := 0, 0
+		for i, p := range s.pods {
+			if len(p.running) == 0 {
+				continue
+			}
+			share := p.capacity * dt / float64(len(p.running))
+			kept := p.running[:0]
+			for _, r := range p.running {
+				r.remaining -= share
+				if r.remaining > 0 {
+					kept = append(kept, r)
+					continue
+				}
+				s.local[r.gateway][i]--
+				if r.arrival >= cfg.Warmup.Seconds() {
+					s.latencies = append(s.latencies, s.now+dt-r.arrival)
+				}
+			}
+			p.running = kept
+			maxRun = max(maxRun, len(kept))
+			sumRun += len(kept)
+		}
+		if s.now >= cfg.Warmup.Seconds() && sumRun > 0 {
+			s.loadRatioSum += float64(maxRun) / (float64(sumRun) / float64(len(s.pods)))
+			s.loadRatioN++
+		}
+	}
+	sort.Float64s(s.latencies)
+	mean := 0.0
+	for _, l := range s.latencies {
+		mean += l
+	}
+	res := result{
+		Policy:        s.pol.String(),
+		Requests:      s.decided,
+		Agreement:     float64(s.agree) / float64(s.decided),
+		Gated:         float64(s.gated) / float64(s.decided),
+		MeanLatency:   mean / float64(len(s.latencies)),
+		P99Latency:    s.latencies[len(s.latencies)*99/100],
+		ScoredPerReq:  float64(s.scored) / float64(s.decided),
+		MaxToMeanLoad: s.loadRatioSum / float64(s.loadRatioN),
+	}
+	if cfg.PrefixOn {
+		res.PrefixHit = float64(s.hits) / float64(s.decided)
+	}
+	return res
+}
+
+func TestCandidateSelectionQuality(t *testing.T) {
+	if os.Getenv("CANDIDATE_SIM") == "" {
+		t.Skip("set CANDIDATE_SIM=1 to run the candidate-selection simulation")
+	}
+	policies := []policy{
+		{Kind: policyFull},
+		{Kind: policyRandom, K: 8},
+		{Kind: policyRandom, K: 16},
+		{Kind: policyRandom, K: 32},
+		{Kind: policyRandomSeeded, K: 16},
+		{Kind: policyCountIndex, K: 16},
+		{Kind: policyCountIndexMixed, K: 16},
+		{Kind: policySnapshot, K: 16, SnapshotRefresh: 5 * time.Millisecond},
+		{Kind: policySnapshot, K: 8, SnapshotRefresh: 50 * time.Millisecond},
+		{Kind: policySnapshot, K: 16, SnapshotRefresh: 50 * time.Millisecond},
+		{Kind: policySnapshot, K: 32, SnapshotRefresh: 50 * time.Millisecond},
+	}
+	var out strings.Builder
+	for _, prefixOn := range []bool{false, true} {
+		for _, delay := range []time.Duration{0, 100 * time.Millisecond, time.Second} {
+			cfg := simConfig{
+				Pods: 500, Gateways: 4, Utilization: 0.85, MeanWork: 200,
+				PrefixOn: prefixOn, PrefixGroups: 2000, PrefixPerPod: 32, PrefixSaving: 0.3,
+				SignalDelay: delay, Step: 5 * time.Millisecond,
+				Warmup: 5 * time.Second, Duration: 25 * time.Second,
+				PrefixSeedMax: 4, Seed: 42,
+				ImbalanceMinGap: 8, ImbalanceFactor: 2,
+			}
+			fmt.Fprintf(&out, "\n### prefix=%v signal delay=%v (N=%d, %d gateways, utilization %.2f)\n\n",
+				prefixOn, delay, cfg.Pods, cfg.Gateways, cfg.Utilization)
+			out.WriteString("| Policy | Agreement | Mean latency (s) | P99 latency (s) | Max/mean running | Prefix hit | Gate fired | Pods scored/req |\n")
+			out.WriteString("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+			// Each policy's simulation has its own state and random source, so they run in parallel.
+			results := make([]result, len(policies))
+			var wg sync.WaitGroup
+			for j, pol := range policies {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					results[j] = newSim(cfg, pol).run()
+				}()
+			}
+			wg.Wait()
+			for _, res := range results {
+				hit := "-"
+				if prefixOn {
+					hit = fmt.Sprintf("%.1f%%", 100*res.PrefixHit)
+				}
+				fmt.Fprintf(&out, "| %s | %.1f%% | %.3f | %.3f | %.2f | %s | %.1f%% | %.0f |\n",
+					res.Policy, 100*res.Agreement, res.MeanLatency, res.P99Latency, res.MaxToMeanLoad, hit, 100*res.Gated, res.ScoredPerReq)
+			}
+		}
+	}
+	t.Log(out.String())
+	if path := os.Getenv("CANDIDATE_SIM_OUT"); path != "" {
+		if err := os.WriteFile(path, []byte(out.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
