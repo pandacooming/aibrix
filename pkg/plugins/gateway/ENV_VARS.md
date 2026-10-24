@@ -203,7 +203,7 @@ per-replica inflight cap is set, its saturation filter still runs over every rea
 | Variable | Type | Default | Description | Source |
 |---|---|---|---|---|
 | `AIBRIX_ROUTING_CANDIDATE_K` | int | `0` | Number of ready pods, drawn at random, that the gate and the router consider. `0` disables the candidate stage. | [algorithms/candidates.go](algorithms/candidates.go) |
-| `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` | int | `4` | Maximum number of pods the router may seed into the candidate set on top of the K random pods. `0` turns seeding off. | [algorithms/candidates.go](algorithms/candidates.go) |
+| `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` | int | `16` | Maximum number of pods the router may seed into the candidate set on top of the K random pods. A hot prefix is held by more pods in a larger fleet, and the router can only prefer the least loaded of the holders it is given, so keep this near K. `0` turns seeding off. | [algorithms/candidates.go](algorithms/candidates.go) |
 
 Both can also be set per request by the model config profile (`routingConfig.candidate.*`); see [Model Config Profile Overrides](#model-config-profile-overrides).
 

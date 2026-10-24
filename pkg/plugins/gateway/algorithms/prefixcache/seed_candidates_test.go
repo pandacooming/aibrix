@@ -76,3 +76,44 @@ func TestSeedCandidates_ReturnsPrefixHoldersLongestFirst(t *testing.T) {
 	assert.Empty(t, router.SeedCandidates(newCtx("zero", full), podList, 0))
 	assert.Empty(t, router.SeedCandidates(newCtx("miss", "an unrelated prompt"), podList, 4))
 }
+
+// TestSeedCandidates_SpreadsTiesOverAllHolders checks that when more pods hold the prefix than
+// fit in max, the seeds rotate over all of them instead of always naming the same ones.
+func TestSeedCandidates_SpreadsTiesOverAllHolders(t *testing.T) {
+	pods := make([]*v1.Pod, 8)
+	for i := range pods {
+		pods[i] = &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pod-%d", i), Namespace: "default"},
+			Status: v1.PodStatus{
+				PodIP:      fmt.Sprintf("10.0.0.%d", i+1),
+				Conditions: []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}},
+			},
+		}
+	}
+	podList := &utils.PodArray{Pods: pods}
+	tok, err := tokenizer.NewTokenizer("character", nil)
+	require.NoError(t, err)
+	router := prefixCacheRouter{
+		cache:              cache.NewWithPodsForTest(pods, "m1"),
+		tokenizer:          tok,
+		prefixCacheIndexer: prefixcacheindexer.NewPrefixHashTable(),
+	}
+	prompt := strings.Repeat("shared conversation ", 16)
+	for i, pod := range pods {
+		ctx := types.NewRoutingContext(context.Background(), RouterPrefixCache, "m1", prompt, fmt.Sprintf("add-%d", i), "")
+		require.NoError(t, router.PostRouteUpdate(ctx, podList, pod))
+		ctx.Delete()
+	}
+
+	seen := map[*v1.Pod]bool{}
+	for i := 0; i < 200; i++ {
+		ctx := types.NewRoutingContext(context.Background(), RouterPrefixCache, "m1", prompt, fmt.Sprintf("seed-%d", i), "")
+		seeds := router.SeedCandidates(ctx, podList, 2)
+		ctx.Delete()
+		require.Len(t, seeds, 2)
+		for _, pod := range seeds {
+			seen[pod] = true
+		}
+	}
+	assert.Len(t, seen, len(pods), "every holder of the prefix is seeded some of the time")
+}

@@ -174,7 +174,7 @@ func BenchmarkFleetRouting_NoShuffle(b *testing.B) { benchmarkFleetRouting(b, 0,
 func BenchmarkFleetRouting_K16(b *testing.B) { benchmarkFleetRouting(b, 16, utils.Shuffle[*v1.Pod]) }
 
 // BenchmarkFleetRouting_CandidateStage runs the candidate stage at its documented sizes,
-// K=16 and M=4, so it can be read against BenchmarkFleetRouting_Full.
+// K=16 and M=16, so it can be read against BenchmarkFleetRouting_Full.
 func BenchmarkFleetRouting_CandidateStage(b *testing.B) {
 	silenceKlog(b)
 	for _, n := range fleetBenchSizes {
@@ -187,7 +187,7 @@ func BenchmarkFleetRouting_CandidateStage(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					prompt := fleetBenchPrompts[i%len(fleetBenchPrompts)]
-					routeFleetCandidatesOnce(b, rm, c, all, strategy, prompt, 16, 4)
+					routeFleetCandidatesOnce(b, rm, c, all, strategy, prompt, 16, 16)
 				}
 			})
 		}

@@ -35,7 +35,7 @@ import (
 // a model config profile can set both through routingConfig.candidate.
 var (
 	routingCandidateK       = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_K", 0)
-	routingCandidatePrefixM = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_PREFIX_M", 4)
+	routingCandidatePrefixM = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_PREFIX_M", 16)
 )
 
 // candidateSafeStrategies are the strategies whose choice depends only on the pods they are

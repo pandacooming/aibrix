@@ -92,7 +92,7 @@ func probeRoutingDefaults() *types.RoutingOverrides {
 			BucketServeMode:       string(pd.BucketModeRPS),
 			PrefillRequestTimeout: 30 * time.Second,
 		},
-		Candidate: types.CandidateOverrides{K: 0, PrefixM: 4},
+		Candidate: types.CandidateOverrides{K: 0, PrefixM: 16},
 	}
 }
 

@@ -653,6 +653,9 @@ func (p prefixCacheRouter) SeedCandidates(ctx *types.RoutingContext, readyPodLis
 			matched = append(matched, i)
 		}
 	}
+	// Holders of the same match length are interchangeable here; shuffle them so the seeds of
+	// a hot prefix spread over all its holders instead of always naming the first M.
+	rand.Shuffle(len(matched), func(a, b int) { matched[a], matched[b] = matched[b], matched[a] })
 	sort.SliceStable(matched, func(a, b int) bool { return scores[matched[a]] > scores[matched[b]] })
 	if len(matched) > max {
 		matched = matched[:max]
