@@ -634,6 +634,36 @@ func (p prefixCacheRouter) ScoreAll(ctx *types.RoutingContext, readyPodList type
 	return scores, scored, nil
 }
 
+// SeedCandidates returns up to max ready pods that hold a cached prefix of this request,
+// longest match first, so a bounded candidate set keeps them. It reads only the in-memory
+// prefix index; the tokens it computes are cached on ctx for Route and ScoreAll.
+func (p prefixCacheRouter) SeedCandidates(ctx *types.RoutingContext, readyPodList types.PodList, max int) []*v1.Pod {
+	if max <= 0 {
+		return nil
+	}
+	scores, scored, err := p.ScoreAll(ctx, readyPodList)
+	if err != nil {
+		klog.V(4).ErrorS(err, "prefix-cache candidate seeding skipped", "request_id", ctx.RequestID)
+		return nil
+	}
+	pods := readyPodList.All()
+	matched := make([]int, 0, max)
+	for i := range pods {
+		if scored[i] && scores[i] > 0 {
+			matched = append(matched, i)
+		}
+	}
+	sort.SliceStable(matched, func(a, b int) bool { return scores[matched[a]] > scores[matched[b]] })
+	if len(matched) > max {
+		matched = matched[:max]
+	}
+	seeds := make([]*v1.Pod, len(matched))
+	for j, i := range matched {
+		seeds[j] = pods[i]
+	}
+	return seeds
+}
+
 // Polarity returns whether higher or lower score is better.
 func (p prefixCacheRouter) Polarity() types.Polarity {
 	return types.PolarityMost
