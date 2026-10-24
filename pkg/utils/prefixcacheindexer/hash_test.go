@@ -411,3 +411,48 @@ func TestStalePodStopsMatchingWithoutAnotherAdd(t *testing.T) {
 	matched, _ := cache.MatchPrefix(tokens, model, map[string]struct{}{recent: {}, stale: {}})
 	assert.Equal(t, map[string]int{recent: 100}, matched)
 }
+
+// MatchPrefix walks whichever set is smaller: the block's holders when the request has many
+// ready pods, or the ready pods when only a few remain. Both must give the same result: a
+// pod matches only the blocks it holds without a gap from the first one, a stale holder never
+// matches, and pods that are not ready never match.
+func TestMatchPrefixWalksTheSmallerSet(t *testing.T) {
+	originalBlockSize := prefixCacheBlockSize
+	defer func() { prefixCacheBlockSize = originalBlockSize }()
+	prefixCacheBlockSize = 4
+
+	cache := NewPrefixHashTable()
+	clock := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	cache.now = func() time.Time { return clock }
+
+	const model = "m"
+	tokens := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	hashes := cache.GetPrefixHashes(tokens)
+	cache.AddPrefix(hashes[:1], model, "ns/stale")
+	clock = clock.Add(prefixCacheEvictionDuration + time.Minute)
+	cache.AddPrefix(hashes, model, "ns/full")
+	cache.AddPrefix(hashes[:2], model, "ns/two-thirds")
+	cache.AddPrefix(hashes[:1], model, "ns/one-third")
+	cache.AddPrefix(hashes, model, "ns/not-ready")
+	cache.AddPrefix(hashes[1:], model, "ns/gap") // holds the later blocks but not the first
+
+	want := map[string]int{"ns/full": 100, "ns/two-thirds": 66, "ns/one-third": 33}
+	ready := []string{"ns/full", "ns/two-thirds", "ns/one-third", "ns/stale", "ns/gap"}
+
+	large := map[string]struct{}{}
+	for _, pod := range ready {
+		large[pod] = struct{}{}
+	}
+	for i := 0; i < 100; i++ {
+		large[fmt.Sprintf("ns/idle-%d", i)] = struct{}{}
+	}
+	matched, _ := cache.MatchPrefix(tokens, model, large)
+	assert.Equal(t, want, matched, "many ready pods: walk the block's holders")
+
+	small := map[string]struct{}{}
+	for _, pod := range ready {
+		small[pod] = struct{}{}
+	}
+	matched, _ = cache.MatchPrefix(tokens, model, small)
+	assert.Equal(t, want, matched, "few ready pods: walk the ready pods")
+}
