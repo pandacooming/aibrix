@@ -157,3 +157,18 @@ Mean latency relative to full scoring on exact counts (today with Redis), same s
 | C count index K=16, live stage 2 | 1s | 8.77 (8.31 to 9.13) | 6.43 (6.25 to 6.55) / 84.3% |
 | C+A index K/2 + random K/2, K=16, live stage 2 | 1s | 1.03 (1.02 to 1.04) | 1.36 (1.03 to 2.02) / 97.3% |
 | C count index K=16 | 1s | 11.73 (11.48 to 12.21) | 7.61 (7.47 to 7.82) / 83.8% |
+
+## Live stage 2 at N=2,000
+
+`CANDIDATE_SIM=live CANDIDATE_SIM_QUICK=1 CANDIDATE_SIM_PODS=2000 [CANDIDATE_SIM_M=16] [CANDIDATE_SIM_SEED_RANDOM=1] go test -run TestCandidateSelectionLiveStage2 ...`: one seed, 100 ms index refresh. Mean latency relative to full scoring on exact counts; prefix hit ratio after the slash. Full scoring: 0.050 s with prefix off, 0.035 s / 99.8% with prefix on.
+
+| Policy | M | Prefix holders seeded | Prefix off | Prefix on |
+| --- | --- | --- | --- | --- |
+| A random+prefix K=16, live stage 2 | 4 | least loaded first | 1.06 | 1.30 / 99.8% |
+| C+A index K/2 + random K/2, K=16, live stage 2 | 4 | least loaded first | 1.00 | 1.24 / 99.8% |
+| A random+prefix K=16, live stage 2 | 16 | least loaded first | 1.06 | 1.04 / 99.9% |
+| C+A index K/2 + random K/2, K=16, live stage 2 | 16 | least loaded first | 1.00 | 1.01 / 99.9% |
+| A random+prefix K=16, live stage 2 | 16 | random (as the prototype) | 1.06 | 1.01 / 99.9% |
+| C+A index K/2 + random K/2, K=16, live stage 2 | 16 | random (as the prototype) | 1.00 | 1.01 / 99.8% |
+
+With 2,000 pods each prefix group is held by about 32 pods (8 at N=500). Full scoring picks the least loaded holder; with M=4 the candidates hold only four, which costs about a quarter of the mean latency. M=16 closes the gap. Seeding holders at random does at least as well as ranking them by the gateway's possibly stale view, so the prototype needs no load signal to pick its seeds.

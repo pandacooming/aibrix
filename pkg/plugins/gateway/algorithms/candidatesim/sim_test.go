@@ -44,6 +44,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -326,7 +327,12 @@ func (s *sim) prefixSeeds(g, group int, allowed map[int]bool) []int {
 			holders = append(holders, h)
 		}
 	}
-	sort.Slice(holders, func(a, b int) bool { return s.loadScore(g, holders[a]) < s.loadScore(g, holders[b]) })
+	if seedRandomHolders {
+		// The prototype ranks holders by match length only, with ties broken at random.
+		s.rng.Shuffle(len(holders), func(a, b int) { holders[a], holders[b] = holders[b], holders[a] })
+	} else {
+		sort.Slice(holders, func(a, b int) bool { return s.loadScore(g, holders[a]) < s.loadScore(g, holders[b]) })
+	}
 	if len(holders) > s.cfg.PrefixSeedMax {
 		holders = holders[:s.cfg.PrefixSeedMax]
 	}
@@ -744,16 +750,21 @@ func TestCandidateSelectionLiveStage2(t *testing.T) {
 		{Kind: policyCountIndex, K: 16},
 	}
 	seeds := []uint64{1, 2, 3}
+	delays := []time.Duration{100 * time.Millisecond, time.Second}
+	if os.Getenv("CANDIDATE_SIM_QUICK") != "" {
+		seeds, delays = seeds[:1], delays[:1]
+		policies = []policy{policies[0], policies[2]}
+	}
 	var out strings.Builder
 	out.WriteString("Mean latency relative to full scoring on exact counts (today with Redis), same seed: mean (min to max). Prefix hit ratio after the slash.\n\n")
 	out.WriteString("| Policy | Index refresh | Prefix off | Prefix on |\n| --- | --- | --- | --- |\n")
 	base := func(prefixOn bool, delay time.Duration, seed uint64) simConfig {
 		return simConfig{
-			Pods: 500, Gateways: 4, Utilization: 0.85, MeanWork: 200,
+			Pods: livePods(), Gateways: 4, Utilization: 0.85, MeanWork: 200,
 			PrefixOn: prefixOn, PrefixGroups: 2000, PrefixPerPod: 32, PrefixSaving: 0.3,
 			SignalDelay: delay, Step: 5 * time.Millisecond,
 			Warmup: 3 * time.Second, Duration: 25 * time.Second,
-			PrefixSeedMax: 4, Seed: seed,
+			PrefixSeedMax: liveM(), Seed: seed,
 			ImbalanceMinGap: 8, ImbalanceFactor: 2,
 		}
 	}
@@ -778,7 +789,6 @@ func TestCandidateSelectionLiveStage2(t *testing.T) {
 			run(base(prefixOn, 0, seed), policy{Kind: policyFull}, func(r result) { full[[2]int{pi, ki}] = r })
 		}
 	}
-	delays := []time.Duration{100 * time.Millisecond, time.Second}
 	got := map[[4]int]result{}
 	for di, delay := range delays {
 		for poi, pol := range policies {
@@ -822,3 +832,19 @@ func TestCandidateSelectionLiveStage2(t *testing.T) {
 		}
 	}
 }
+
+func livePods() int {
+	if n, err := strconv.Atoi(os.Getenv("CANDIDATE_SIM_PODS")); err == nil && n > 0 {
+		return n
+	}
+	return 500
+}
+
+func liveM() int {
+	if n, err := strconv.Atoi(os.Getenv("CANDIDATE_SIM_M")); err == nil && n >= 0 {
+		return n
+	}
+	return 4
+}
+
+var seedRandomHolders = os.Getenv("CANDIDATE_SIM_SEED_RANDOM") != ""
