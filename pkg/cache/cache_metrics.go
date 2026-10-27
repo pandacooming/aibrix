@@ -332,6 +332,7 @@ func (c *Store) getPodModelMetricName(modelName string, metricName string) strin
 
 func (c *Store) updatePodMetrics() {
 	now := time.Now()
+	c.refreshRunningRequestsGaugeCounts()
 	c.metaPods.Range(func(key string, metaPod *Pod) bool {
 		if !utils.FilterReadyPod(metaPod.Pod) {
 			// Skip unready pod
@@ -799,31 +800,24 @@ func (c *Store) updateThroughputToksPerS(pod *Pod, model, metric string, metricV
 	}
 }
 
-// syncRunningRequestsGlobally computes the cross-gateway running request count for a pod and
-// stores it so GetMetricValueByPod returns the global total. It reads the in-memory snapshot
-// cache (populated every 100ms by initGatewaySnapshotSync — no Redis call here), sums
-// requests_running from all other gateway instances, then adds this gateway's own local
-// atomic counter (always fresher than the Redis snapshot for the local instance).
+// syncRunningRequestsGlobally stores the cross-gateway running request count of a pod so
+// GetMetricValueByPod returns the global total. It reads the counts refreshRunningRequestsGaugeCounts
+// last read (no Redis call here). Until a first read has succeeded nothing is published and the
+// metric is left alone; after that, a pod without a count in Redis (no gateway has routed to it
+// yet) reports this gateway's local count.
 func (c *Store) syncRunningRequestsGlobally(pod *Pod) {
-	raw := c.gatewaySnapshotCache.Load()
+	raw := c.runningRequestsGaugeCounts.Load()
 	if raw == nil {
 		return
 	}
-	snapshotCache := raw.(map[string][]map[string]string)
-
-	var remoteRunning float64
-	podKey := utils.GeneratePodKey(pod.Namespace, pod.Name)
-	for _, fields := range snapshotCache[podKey] {
-		if fields["gateway_instance_id"] == gatewayPodName {
-			continue
-		}
-		running, _ := strconv.ParseFloat(fields["requests_running"], 64)
-		remoteRunning += running
-	}
+	counts := raw.(map[string]int64)
 
 	localRunning := float64(atomic.LoadInt32(&pod.runningRequests))
-	total := localRunning + remoteRunning
-	klog.V(5).InfoS("running requests aggregation", "pod", pod.Name, "local", localRunning, "remote", remoteRunning, "total", total)
+	total := localRunning
+	if count, ok := counts[utils.GeneratePodKey(pod.Namespace, pod.Name)]; ok {
+		total = float64(count)
+	}
+	klog.V(5).InfoS("running requests aggregation", "pod", pod.Name, "local", localRunning, "total", total)
 
 	totalValue := &metrics.SimpleMetricValue{Value: total}
 	metrics.EmitMetricToPrometheus(&types.RoutingContext{}, pod.Pod, metrics.RealtimeNumRequestsRunning, totalValue, nil)

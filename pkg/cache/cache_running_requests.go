@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -32,8 +33,7 @@ import (
 
 const (
 	// runningRequestsKeyPrefix namespaces the real-time cross-gateway running-request
-	// counters in Redis -- distinct from the per-gateway-instance keys in
-	// cache_gateway_snapshot.go, which this counter does not use or replace.
+	// counters in Redis.
 	runningRequestsKeyPrefix = "aibrix:rrq"
 	// runningRequestsGatewaysKey is a single sorted set recording the last heartbeat
 	// timestamp (ms) of every gateway instance that has this counter active. It is
@@ -119,6 +119,18 @@ var runningRequestsReadTimeout = 100 * time.Millisecond
 func newRunningRequestsGatewayInstanceID(podName string) string {
 	return podName + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
 }
+
+// gatewayPodName is this gateway's pod name (POD_NAME, else the hostname).
+var gatewayPodName = func() string {
+	if name := os.Getenv("POD_NAME"); name != "" {
+		return name
+	}
+	name, _ := os.Hostname()
+	if name == "" {
+		return "unknown-gateway"
+	}
+	return name
+}()
 
 // runningRequestsGatewayInstanceID is this process's identity for the running-requests
 // hash field and liveness ZSET member -- see newRunningRequestsGatewayInstanceID. A
