@@ -202,7 +202,7 @@ func calculateAttnQuadV100(numTokens int, seqLen *int) float64 {
 // getPrefillCost estimates the prefill time of one prefix-cache node under the
 // GPU model this request assumes. gpu is the environment default unless the
 // request's model config profile overrides it.
-func (h *SlidingWindowHistogram) getPrefillCost(node *prefixcacheindexer.TreeNode, gpu string) float64 {
+func (h *SlidingWindowHistogram) getPrefillCost(node *prefixcacheindexer.TreeNode, gpu string, holders int) float64 {
 	missRate := 1.0
 	if h.promptTokens[node] > 0 {
 		missRate = 1.0 - (float64(h.hitTokens[node]) / float64(h.promptTokens[node]))
@@ -231,8 +231,8 @@ func (h *SlidingWindowHistogram) getPrefillCost(node *prefixcacheindexer.TreeNod
 		attnQuad = calculateAttnQuadV100(numTokens, nil)
 	}
 	prefillTime := (baseTime + attnQuad) / 0.9
-	numPods := node.GetModelToPodCount() // You might need to adjust this based on your actual GPU allocation tracking
-	totalPrefillCost := missRate * float64(h.nodeToCount[node]) * prefillTime / float64(numPods)
+	// Split the prefill across the pods holding the node, as Preble does.
+	totalPrefillCost := missRate * float64(h.nodeToCount[node]) * prefillTime / float64(max(holders, 1))
 	return totalPrefillCost
 }
 
@@ -366,9 +366,9 @@ func (h *SlidingWindowHistogram) getSimplePrefillCost(node *prefixcacheindexer.T
 	return missRate * float64(h.nodeToCount[node]) * prefillTime
 }
 
-func (h *SlidingWindowHistogram) getNodeCost(node *prefixcacheindexer.TreeNode, podKey string, gpu string) float64 {
+func (h *SlidingWindowHistogram) getNodeCost(node *prefixcacheindexer.TreeNode, podKey string, gpu string, holders int) float64 {
 	// prefillCost := h.getSimplePrefillCost(node)
-	prefillCost := h.getPrefillCost(node, gpu)
+	prefillCost := h.getPrefillCost(node, gpu, holders)
 	// Get median time per token for the pod
 	timePerToken := 0.15 // default value
 	if times, ok := h.avgTimePerTokenPerPod[podKey]; ok && len(times) > 0 {
@@ -392,7 +392,7 @@ func (h *SlidingWindowHistogram) getCurrentAllocationCostPerPod(gpu string) map[
 		// Iterate through all models and their pods for this node
 		for _, modelPods := range node.GetModelToPods() {
 			for podKey := range modelPods {
-				costs[podKey] += h.getNodeCost(node, podKey, gpu)
+				costs[podKey] += h.getNodeCost(node, podKey, gpu, len(modelPods))
 			}
 		}
 	}
