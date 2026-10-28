@@ -91,6 +91,13 @@ func (c *Store) calculateMean1m(pod *Pod, modelName, metricName string, histogra
 	}
 
 	sum, count := histogram.Sum-base.Value, histogram.Count-base.Count
+	if count == 0 && sum == 0 && history[0].Count < histogram.Count {
+		// Nothing in the last minute, typically because routers stopped picking this
+		// pod. Use the mean since the oldest snapshot (up to 3 minutes) rather than
+		// the lifetime mean, so a pod that was slow does not look fast again just
+		// because it is idle.
+		sum, count = histogram.Sum-history[0].Value, histogram.Count-history[0].Count
+	}
 	if sum < 0 || count <= 0 {
 		// No observation in the window, or the engine restarted and the histogram
 		// started again from zero: either way, readers use the lifetime mean.
