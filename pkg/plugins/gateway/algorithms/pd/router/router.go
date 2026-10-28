@@ -1057,8 +1057,12 @@ func (r *pdRouter) loadImbalanceSelectDecodePodWithLedger(ctx *types.RoutingCont
 
 		kvUsage, err := r.cache.GetMetricValueByPodModel(pod.Name, pod.Namespace, ctx.Model, metrics.KVCacheUsagePerc)
 		kvUsageVal := float64(0)
-		if err == nil && kvUsage != nil && isFinite(kvUsage.GetSimpleValue()) {
-			kvUsageVal = kvUsage.GetSimpleValue()
+		// +Inf usage still reads as full below (as any usage above 1 does); only
+		// NaN and -Inf would make the free-GPU maximum non-finite.
+		if err == nil && kvUsage != nil {
+			if v := kvUsage.GetSimpleValue(); !math.IsNaN(v) && !math.IsInf(v, -1) {
+				kvUsageVal = v
+			}
 		}
 		podFreeGpuUsage[podKey] = math.Round(100 - kvUsageVal*100)
 		if podFreeGpuUsage[podKey] <= 0 {
