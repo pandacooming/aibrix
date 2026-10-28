@@ -1023,6 +1023,17 @@ func (r *pdRouter) loadImbalanceSelectDecodePodWithLedger(ctx *types.RoutingCont
 	// gateway's local view.
 	runningReqCounts, runningErr := r.decodeRunningRequests(filteredDecodePods, remoteLedger)
 
+	meanFiniteKVUsage, finiteKV := 0.0, 0
+	for _, pod := range filteredDecodePods {
+		if v, err := r.cache.GetMetricValueByPodModel(pod.Name, pod.Namespace, ctx.Model, metrics.KVCacheUsagePerc); err == nil && v != nil && isFinite(v.GetSimpleValue()) {
+			meanFiniteKVUsage += v.GetSimpleValue()
+			finiteKV++
+		}
+	}
+	if finiteKV > 0 {
+		meanFiniteKVUsage /= float64(finiteKV)
+	}
+
 	for _, pod := range filteredDecodePods {
 		podKey := utils.GeneratePodKey(pod.Namespace, pod.Name)
 		requestCount := r.pendingDecodeTracker.GetPendingDecodeCount(podKey)
@@ -1057,8 +1068,13 @@ func (r *pdRouter) loadImbalanceSelectDecodePodWithLedger(ctx *types.RoutingCont
 
 		kvUsage, err := r.cache.GetMetricValueByPodModel(pod.Name, pod.Namespace, ctx.Model, metrics.KVCacheUsagePerc)
 		kvUsageVal := float64(0)
-		if err == nil && kvUsage != nil && isFinite(kvUsage.GetSimpleValue()) {
-			kvUsageVal = kvUsage.GetSimpleValue()
+		if err == nil && kvUsage != nil {
+			if v := kvUsage.GetSimpleValue(); isFinite(v) {
+				kvUsageVal = v
+			} else {
+				// Unknown usage: neutral (the mean of the finite readings), not "all free".
+				kvUsageVal = meanFiniteKVUsage
+			}
 		}
 		podFreeGpuUsage[podKey] = math.Round(100 - kvUsageVal*100)
 		if podFreeGpuUsage[podKey] <= 0 {
