@@ -20,18 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 
-	"github.com/vllm-project/aibrix/pkg/cache"
-	"github.com/vllm-project/aibrix/pkg/metrics"
-	"github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms/least"
 	"github.com/vllm-project/aibrix/pkg/types"
-	"github.com/vllm-project/aibrix/pkg/utils"
 )
 
 func unifiedContext(t testing.TB, strategy string, k int) *types.RoutingContext {
@@ -92,65 +87,6 @@ func TestUnifiedCandidatesRetainRandomExploration(t *testing.T) {
 	}
 	for _, p := range pods[4:] {
 		assert.InDelta(t, 1000, counts[p], 170, p.Name)
-	}
-}
-
-type candidateReadGuard struct {
-	cache.Cache
-	reads int
-}
-
-func (c *candidateReadGuard) GetPodsRunningRequests(pods []*v1.Pod) (map[string]int64, error) {
-	c.reads++
-	return c.Cache.GetPodsRunningRequests(pods)
-}
-func (c *candidateReadGuard) GetPodRunningRequests(name, ns string) (int64, error) {
-	c.reads++
-	return c.Cache.GetPodRunningRequests(name, ns)
-}
-
-func TestUnifiedSeedersUseHintsWithoutReadingLiveCounts(t *testing.T) {
-	pods := candidatePods(3)
-	podMetrics := map[string]map[string]metrics.MetricValue{}
-	for i, p := range pods {
-		podMetrics[p.Name] = map[string]metrics.MetricValue{
-			metrics.RealtimeNumRequestsRunning:  &metrics.SimpleMetricValue{Value: float64(30 - i*10)},
-			metrics.RealtimeOutputTokenRateEWMA: &metrics.SimpleMetricValue{Value: 1000},
-			metrics.KVCacheUsagePerc:            &metrics.SimpleMetricValue{Value: float64(i) / 10},
-		}
-	}
-	store := cache.NewWithPodsMetricsForTest(pods, "m1", podMetrics)
-	store = cache.InitWithPodsModelMetrics(store, podMetrics)
-	t.Cleanup(store.Close)
-	guard := &candidateReadGuard{Cache: store}
-	lb, err := NewLoadBalanceRouterWithCache(guard)
-	require.NoError(t, err)
-	kv, err := least.NewLeastKvCacheRouterWithCache(guard)
-	require.NoError(t, err)
-	routers := []struct {
-		name   string
-		router types.Router
-		want   *v1.Pod
-	}{
-		{"load", lb, pods[2]}, {"least-request", least.NewLeastRequestTopKRouterWithCache(guard), pods[2]}, {"kv", kv, pods[0]},
-	}
-	for _, tc := range routers {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := unifiedContext(t, "load-balance", 2)
-			ctx.StartRunningRequestsSnapshot()
-			seeder := tc.router.(types.CandidateSeeder)
-			require.Equal(t, []*v1.Pod{tc.want}, seeder.SeedCandidates(ctx, &utils.PodArray{Pods: pods}, 1))
-			require.Zero(t, guard.reads, "seeders must not read Redis-backed count APIs")
-			// Live scoring must not find the approximate hints in the request snapshot.
-			liveReads := 0
-			_, err := ctx.RunningRequests(pods, func([]*v1.Pod) (map[string]int64, error) { liveReads++; return map[string]int64{}, nil })
-			require.NoError(t, err)
-			require.Equal(t, 1, liveReads)
-			ov := *ctx.RoutingOverrides()
-			ov.Candidate.LegacyPrefixM = true
-			ctx.SetRoutingOverrides(&ov)
-			require.Empty(t, seeder.SeedCandidates(ctx, &utils.PodArray{Pods: pods}, 1), "new seeders must not change legacy K+M behavior")
-		})
 	}
 }
 
@@ -233,18 +169,4 @@ func BenchmarkUnifiedCandidateSelection(b *testing.B) {
 			})
 		}
 	}
-}
-
-func TestUnifiedLoadSeederMissingOrInvalidHints(t *testing.T) {
-	pods := candidatePods(3)
-	metricsByPod := map[string]map[string]metrics.MetricValue{
-		pods[0].Name: {metrics.RealtimeNumRequestsRunning: &metrics.SimpleMetricValue{Value: math.NaN()}},
-		pods[1].Name: {metrics.RealtimeNumRequestsRunning: &metrics.SimpleMetricValue{Value: math.Inf(1)}},
-	}
-	store := cache.NewWithPodsMetricsForTest(pods, "m1", metricsByPod)
-	t.Cleanup(store.Close)
-	r, err := NewLoadBalanceRouterWithCache(store)
-	require.NoError(t, err)
-	ctx := unifiedContext(t, "load-balance", 4)
-	require.Empty(t, r.(types.CandidateSeeder).SeedCandidates(ctx, &utils.PodArray{Pods: pods}, 2))
 }

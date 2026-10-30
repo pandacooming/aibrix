@@ -132,39 +132,6 @@ func NewLoadBalanceRouterWithCache(c cache.Cache) (types.Router, error) {
 	return &loadBalanceRouter{cache: c}, nil
 }
 
-// SeedCandidates mirrors load-balance's formula with cached count hints. These
-// approximate scores are not shared with final scoring: ScoreAll must still use
-// the exact Redis-backed running-count snapshot on the selected candidates.
-func (r *loadBalanceRouter) SeedCandidates(ctx *types.RoutingContext, ready types.PodList, max int) []*v1.Pod {
-	if max <= 0 || ctx.RoutingOverrides().Candidate.LegacyPrefixM {
-		return nil
-	}
-	pods := ready.All()
-	counts := routeutil.CachedRequestHints(r.cache, pods)
-	if len(counts) == 0 {
-		return nil
-	}
-	caps := r.capacities(pods)
-	scores, scored := make([]float64, len(pods)), make([]bool, len(pods))
-	lb := ctx.RoutingOverrides().LoadBalance
-	for i, pod := range pods {
-		n, ok := counts[utils.GeneratePodKey(pod.Namespace, pod.Name)]
-		if !ok || caps[i] <= 0 || math.IsNaN(caps[i]) || math.IsInf(caps[i], 0) {
-			continue
-		}
-		load := float64(n)
-		if lb.QueuedWeight > 0 {
-			load += lb.QueuedWeight * routeutil.GetPodModelMetricsSimpleValue(r.cache, pod.Name, pod.Namespace, ctx.Model, metrics.NumRequestsWaiting)
-		}
-		if load < 0 {
-			continue
-		}
-		scores[i] = loadBalanceScore(load, caps[i], r.kvFreeFraction(ctx, pod), lb.KVPressureAlpha, lb.KVCriticalFree)
-		scored[i] = true
-	}
-	return routeutil.RankCandidates(pods, scores, scored, types.PolarityLeast, max)
-}
-
 // ScoreAll returns the effective load of each pod (see loadBalanceScore):
 //
 //	(running + λ·queued) / EWMA(output tokens/sec) × (1 + α·(1−kvFree)²)

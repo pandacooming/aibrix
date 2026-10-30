@@ -38,6 +38,7 @@ var (
 	routingCandidatePrefixM           = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_PREFIX_M", 16)
 	routingCandidatePrefixMConfigured = legacyPrefixMConfigured()
 	legacyCandidateWarning            sync.Once
+	unifiedCandidateInfo              sync.Once
 )
 
 func legacyPrefixMConfigured() bool {
@@ -96,11 +97,19 @@ func candidateStageApplies(ctx *types.RoutingContext) bool {
 func SelectCandidates(ctx *types.RoutingContext, router types.Router, readyPods []*v1.Pod) []*v1.Pod {
 	knobs := ctx.RoutingOverrides().Candidate
 	if !knobs.LegacyPrefixM {
+		if knobs.K > 0 {
+			unifiedCandidateInfo.Do(func() {
+				klog.InfoS("K-only candidate routing enabled; K is the total budget, without the previous implicit M=16", "initial_k", knobs.K)
+			})
+		}
 		return selectUnifiedCandidates(ctx, router, readyPods, knobs.K)
 	}
 	legacyCandidateWarning.Do(func() {
 		klog.Warning("candidate.prefixM / AIBRIX_ROUTING_CANDIDATE_PREFIX_M is deprecated; explicit M preserves legacy K+M routing; omit M and configure a total K budget to migrate")
 	})
+	if knobs.K > 0 {
+		recordCandidateSelection("legacy")
+	}
 	return selectCandidates(ctx, router, readyPods, knobs.K, knobs.PrefixM)
 }
 
@@ -112,6 +121,11 @@ func selectUnifiedCandidates(ctx *types.RoutingContext, router types.Router, rea
 }
 
 func selectCandidates(ctx *types.RoutingContext, router types.Router, readyPods []*v1.Pod, k, m int) []*v1.Pod {
+	seeder, _ := router.(types.CandidateSeeder)
+	return selectCandidatesWithSeeder(ctx, seeder, readyPods, k, m)
+}
+
+func selectCandidatesWithSeeder(ctx *types.RoutingContext, seeder types.CandidateSeeder, readyPods []*v1.Pod, k, m int) []*v1.Pod {
 	// A negative M only turns seeding off; it does not disable the stage.
 	m = max(m, 0)
 	if k <= 0 || len(readyPods) <= k || !candidateStageApplies(ctx) {
@@ -119,7 +133,7 @@ func selectCandidates(ctx *types.RoutingContext, router types.Router, readyPods 
 	}
 
 	var seeds []*v1.Pod
-	if seeder, ok := router.(types.CandidateSeeder); ok && m > 0 {
+	if seeder != nil && m > 0 {
 		seeds = seeder.SeedCandidates(ctx, &utils.PodArray{Pods: readyPods}, m)
 		// Seeders are asked for at most m pods; enforce it so the sampling below never depends on
 		// a seeder honoring that.

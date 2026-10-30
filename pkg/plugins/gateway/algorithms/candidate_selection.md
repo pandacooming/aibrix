@@ -1,45 +1,75 @@
 # Single candidate budget
 
-Follow-up to [Varun's review of #3292](https://github.com/vllm-project/aibrix/pull/3292#discussion_r4403536333), part of #3188. Candidate routing remains off unless K is enabled. This implementation replaces the initial half-RRF draft after comparative testing.
+Part of #3188 and the [second TODO in Varun's review of #3292](https://github.com/vllm-project/aibrix/pull/3292#discussion_r4403536333). Candidate routing is disabled unless K is enabled. This implementation builds on #3343 for decision-scoped raw prefix reuse.
 
 ## Selection
 
-Resolve the complete strategy, including automatic blending, and retain the existing candidate-safe allowlist. For load-balance, least-request, least-kv-cache and prefix-cache, including supported aliases/blends:
+The complete resolved strategy, including auto-blending, must be candidate-safe. Global-view/exclusive strategies retain the full ready set. The central selector combines locally cached observations; there are no separate load/request/KV seeders.
 
-1. Uniformly scout up to 4K ready pods and read explicitly observed running-count hints. Selection does not issue Redis commands or populate the final live-count snapshot.
-2. Without usable hints, call the existing reference selector directly: random K without prefix; with prefix, ceil(K/2) random plus up to floor(K/2) prefix seeds. K is an upper bound in this fallback. K<4 also uses the reference.
-3. With usable counts, read prefix matches once and add at most K uniformly sampled holders to the scouts. Additional count reads cover only the added holders, so total hint reads cover at most 5K pods.
-4. Recommend up to R=min(floor(K/4),4) low-cost pods, using the following admission-cost heuristic:
+1. Uniformly scout up to 4K ready pods. If prefix-cache is enabled, read prefix matches once and add up to K sampled prefix holders. Running-count hint reads cover at most 5K pods, issue no Redis commands and never populate the final live-count snapshot.
+2. Recommend at most `R = min(floor(K/4), 4)` pods. Pure least-request ranks observed running counts. Pure least-kv-cache (and its least-gpu-cache alias) ranks the existing GPU + optional CPU KV usage, independently of request count and token rate; it does not require count hints.
+3. In a KV blend, reserve `ceil(R * kvWeight / (kvWeight + loadWeight + requestWeight))` recommendation slots for the KV objective. Load/request recommendations fill the remaining slots, deduplicating overlaps; missing KV observations can release slots to the available count objective. Prefix affinity discounts KV scores when present.
+4. Load-balance and prefix/load blends use the projected-cost heuristic:
 
    ```text
    (cachedRunning + 1) / capacity * (1 + kvAlpha * kvUsed²)
      / (1 + 0.5 * prefixWeight / otherWeight * matchFraction)
    ```
 
-   Finite positive cached output rates estimate capacity; missing estimates use their mean. With no other strategy, prefix weight is its own denominator. Missing counts are unknown, not zero. This heuristic is not equivalent to final normalized strategy scores.
-5. Preserve up to max(0,floor(K/2)-4R) additional longest-prefix holders, excluding recommendations. Once R saturates, this retains affinity as K grows instead of giving every added slot to random sampling.
-6. Uniformly fill remaining slots outside the seeds. This path returns K distinct ready pods when N>K. Existing gate, final strategy scoring, port selection and admission then run as before.
+   Finite positive cached output rates estimate capacity; missing estimates use their mean. With no other strategy, prefix weight is its own denominator. This preselection heuristic is not equivalent to final normalized strategy scores. Pure least-request uses count alone.
+5. Preserve up to `max(0, floor(K/2) - 4R)` additional longest-prefix holders, where R is the actual recommendation count. Exclude recommendations from this reserve and fill remaining slots uniformly without replacement. This path returns K distinct ready pods when N>K.
+6. The existing gate, live final strategy scoring, normalization, port selection and admission operate on the selected pool.
 
-The user configures only candidate.k: no new ratio, scout-size, time-window or affinity knob is introduced. Other candidate-safe strategies retain reference sampling; global-view/exclusive strategies bypass sampling. Prefix-index lookup and the optional full-fleet inflight prefilter can still scale with N.
+If the requested count objective has no usable observations, use reference selection directly: random K without prefix, or `ceil(K/2)` random plus up to `floor(K/2)` prefix holders. K is an upper bound in this fallback; insufficient holders can leave fewer than K candidates. K<4 also uses the reference. Unknown counts are never assumed idle.
+
+The user configures only K: no new allocation, scout-size or freshness setting. Prefix lookup and the existing full-fleet inflight prefilter can still scale with N.
 
 ## Observed count source
 
-The optional CachedRunningRequestHintProvider keeps remote contributions separate from the current local atomic count. Local updates cannot overwrite remote contributions. Getter calls issue no Redis commands and never populate RoutingContext.RunningRequests.
+`CachedRunningRequestHintProvider` separates remote contributions from the current local atomic count. It reuses the existing background synchronization, without another timer or Redis command. Extra tracking/aggregation starts lazily and adds O(N × gateways) local work and snapshot storage.
 
-The existing background synchronization supplies hints, without another timer or Redis command. Extra tracking/aggregation starts lazily with the first consumer, and costs O(N × gateways) local work and snapshot storage in that loop.
+Source progress is established without comparing gateway clocks. First sightings are unknown. A changed generation proves that a row was written after the preceding successful read began; that reader-local time bounds source age. Each HGETALL batch records its actual read start, excluding earlier write/SCAN phases and preceding batches. Successful unchanged reads and failed reads do not renew validity.
 
-Source progress is established without comparing clocks on different gateways. First sightings are unknown. A changed generation proves that a row was written after the preceding successful read began; that earlier reader-local time conservatively bounds age. Unchanged successful reads and failed reads do not renew it. Source observations expire at 200 ms; consecutive source progress must also be less than 200 ms apart. Isolated samples after a slow gap cannot temporarily re-enable recommendations. Identity changes reset warmup. No Redis, bad values, mismatched identity or stale observations return unknown.
+Source observations expire at 200 ms, and consecutive progress must be less than 200 ms apart. Isolated updates after a slow gap cannot temporarily re-enable recommendations. Missing Redis, invalid values or mismatched gateway/Pod identities return unknown. Per-pod observation ages also bound snapshot age.
 
-The source is approximate, not admission state. It does not establish completeness when an entire gateway contribution disappears. Final live APIs remain authoritative; cached capacity and KV metrics retain their existing semantics.
+This is an approximate source, not admission state. It cannot establish completeness when an entire gateway contribution disappears. Slow synchronization can reduce availability; a partial valid set can still supply recommendations. Final live APIs remain authoritative, and cached capacity/KV metrics keep their existing semantics.
 
-## Compatibility
+## Observability
 
-- New configuration uses K alone. Explicit M in a profile/environment retains deprecated K-random-plus-M-prefix behavior, including M=0, with the existing warning.
-- Existing K-only configuration previously added implicit M=16. Old K=16 plus implicit M=16 corresponds to new K=32 in maximum size, not identical composition.
-- K=0 stays disabled. Small K and missing observations use the reference. No additional service or API configuration is required.
+`aibrix_routing_candidate_selections_total{path}` reports `recommended`, `no_hints`, `small_k`, `no_valid_recommendation`, `unsupported_strategy`, `bypass` or `legacy`. Labels are fixed path names, not arbitrary strategy strings. K=0 leaves this selector inactive.
 
-## Verification
+A one-time INFO log announces K-only mode and the change from the previous implicit M=16. Operators can compare recommended and fallback rates; source tests also measure full-fleet coverage, mean usable-pod coverage and usable observations in a 64-pod scout. These measure different aspects of availability.
 
-See [implementation results](candidatesim/NATIVE_RESULTS.md). Tests cover budgets, ready-set membership, bounded hint reads, prefix retention, untouched live snapshots and explicit-M compatibility. A Redis-backed integration test runs the actual background source, selector, gate and final router; freezing its remote writer while keeping rows readable verifies expiry.
+## Migration / release note
 
-Paired processor-sharing experiments use the real selector, final routers and prefix index, drain measured requests and include A/A controls. They establish results over the stated matrix, not a universal proof for arbitrary engines or traffic. The initial RRF implementation and failed alternatives remain research controls.
+Existing K-only configurations previously added implicit M=16. K now means the total budget: old K=16 plus implicit M=16 corresponds to new K=32 in maximum size, not identical composition. Explicit M in a profile/environment retains deprecated K-random-plus-M-prefix behavior, including M=0, and emits a deprecation warning. K=0 remains disabled.
+
+## Verification and reproduction
+
+Deterministic tests cover each cost term, strategy objectives, KV blends, recommendation caps, exact K=8/16/32/64 composition, insufficient prefix holders, outside-scout prefix holders, fallback paths and metric reasons. Cache tests cover freshness, unchanged/failing reads, mixed remote Pod identities, missing gateway identities and stale local Pod identity. A separate-process integration fixture runs the actual source, selector, gate and final scoring; expiry assertions start only after the full observation window following producer shutdown.
+
+Static objective-quality probe (fixed fleet seeds, stochastic production sampling; this is not latency):
+
+```sh
+AIBRIX_PREFIX_CACHE_BLOCK_NUMBER=1024 AIBRIX_CANDIDATE_QUALITY_PROBE=1 go test ./pkg/plugins/gateway/algorithms -run '^TestCandidateSelectionQualityProbe$' -count=1 -v
+```
+
+It compares random-K and actual selection over 600 trials per cell, with least-request, load-balance, correlated KV and independently varying KV, K=16/32 and three fleet seeds. `gap_captured` is the fraction of the random-to-global-best objective gap closed, not a request-latency percentage.
+
+Real-Redis source timing probe: use a fresh disposable Redis for each combination. For example:
+
+```sh
+docker run --rm -d --name aibrix-candidate-test -p 127.0.0.1:16379:6379 redis:7.4-alpine redis-server --save '' --appendonly no
+AIBRIX_TEST_REDIS_ADDR=127.0.0.1:16379 AIBRIX_TEST_CANDIDATE_PODS=2000 AIBRIX_TEST_CANDIDATE_GATEWAYS=4 go test ./pkg/cache -run '^TestCandidateHintsRedisAvailability$' -count=1 -v
+docker rm -f aibrix-candidate-test
+```
+
+The probe refuses a nonempty database, uses the real background source and co-located 100 ms remote writers, warms for two seconds and measures for three seconds. Test 64/500/2,000 pods and 1/4/8 gateways. It samples the full fleet every 20 ms; measurement and writers share the host CPU, so results characterize that setup rather than production capacity. No GPU or model is required.
+
+Selection-only CPU benchmark, run serially:
+
+```sh
+go test ./pkg/plugins/gateway/algorithms -run '^$' -bench '^BenchmarkNativeCandidateBudget$' -benchmem -benchtime=250ms -count=5
+```
+
+Results belong in the PR description. This document makes no inference/GPU latency or production-wide non-regression claim.

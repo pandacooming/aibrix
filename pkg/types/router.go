@@ -32,10 +32,10 @@ type SingleCandidateBypasser interface {
 	BypassSingleCandidate() bool
 }
 
-// CandidateSeeder provides cheap, ranked candidate hints, such as prefix holders
-// or pods with low cached load. A hint is not a guaranteed final candidate;
-// bounded selection combines raw hints before final live scoring.
-// Explicit legacy prefixM keeps the previous additive prefix-seed policy.
+// CandidateSeeder supplies bounded strategy-selected seeds, currently prefix
+// holders. Explicit legacy M adds these to random candidates; the unified
+// selector may use prefix seeds for its fallback. Other recommendations are
+// computed centrally from bounded local observations.
 type CandidateSeeder interface {
 	// SeedCandidates returns at most max pods from readyPods, best first. It must not read
 	// per-pod state from Redis, because the candidate stage exists to avoid reads over every

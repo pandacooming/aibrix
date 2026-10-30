@@ -116,29 +116,6 @@ func newLeastRequestTopKRouterWithCacheAndClock(c cache.Cache, clock func() time
 // Cache returns the cache the router reads request counts from.
 func (r *LeastRequestTopKRouter) Cache() cache.Cache { return r.cache }
 
-// SeedCandidates ranks cached count hints, including the existing warmup ramp.
-// Exact cross-gateway counts are read only after the candidate set is selected.
-func (r *LeastRequestTopKRouter) SeedCandidates(ctx *types.RoutingContext, ready types.PodList, max int) []*v1.Pod {
-	if max <= 0 || ctx.RoutingOverrides().Candidate.LegacyPrefixM {
-		return nil
-	}
-	pods := ready.All()
-	counts := routeutil.CachedRequestHints(r.cache, pods)
-	known := make([]*v1.Pod, 0, len(counts))
-	for _, pod := range pods {
-		if _, ok := counts[utils.GeneratePodKey(pod.Namespace, pod.Name)]; ok {
-			known = append(known, pod)
-		}
-	}
-	counts = applyRampAdjustment(r.cache, r.now(), known, counts)
-	scores, scored := make([]float64, len(pods)), make([]bool, len(pods))
-	for i, pod := range pods {
-		n, ok := counts[utils.GeneratePodKey(pod.Namespace, pod.Name)]
-		scores[i], scored[i] = float64(n), ok
-	}
-	return routeutil.RankCandidates(pods, scores, scored, types.PolarityLeast, max)
-}
-
 func (r *LeastRequestTopKRouter) now() time.Time {
 	if r.clock == nil {
 		return time.Now()

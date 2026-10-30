@@ -22,18 +22,27 @@ import (
 
 	"github.com/vllm-project/aibrix/pkg/cache"
 	"github.com/vllm-project/aibrix/pkg/metrics"
+	"github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms/least"
 	"github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms/routeutil"
 	"github.com/vllm-project/aibrix/pkg/types"
 	"github.com/vllm-project/aibrix/pkg/utils"
 	v1 "k8s.io/api/core/v1"
 )
 
+const (
+	candidateScoutFactor                  = 4
+	candidateRecommendationDivisor        = 4
+	candidateRecommendationCap            = 4
+	candidatePrefixSlotsPerRecommendation = 4
+)
+
 type candidateSources struct {
-	cache                     cache.Cache
-	prefix                    types.PodScorer
-	seeder                    types.CandidateSeeder
-	prefixWeight, otherWeight float64
-	supported                 bool
+	cache                               cache.Cache
+	prefix                              types.PodScorer
+	seeder                              types.CandidateSeeder
+	prefixWeight, otherWeight           float64
+	loadWeight, requestWeight, kvWeight float64
+	supported                           bool
 }
 
 func candidateRoutingSources(ctx *types.RoutingContext, router types.Router) candidateSources {
@@ -62,7 +71,14 @@ func candidateRoutingSources(ctx *types.RoutingContext, router types.Router) can
 			out.prefixWeight += float64(item.Coefficient)
 			out.prefix, _ = source.(types.PodScorer)
 			out.seeder, _ = source.(types.CandidateSeeder)
-		case "load-balance", "least-request", "least-request-top-k", "least-kv-cache", "least-gpu-cache":
+		case "load-balance":
+			out.loadWeight += float64(item.Coefficient)
+			out.otherWeight += float64(item.Coefficient)
+		case "least-request", "least-request-top-k":
+			out.requestWeight += float64(item.Coefficient)
+			out.otherWeight += float64(item.Coefficient)
+		case "least-kv-cache", "least-gpu-cache":
+			out.kvWeight += float64(item.Coefficient)
 			out.otherWeight += float64(item.Coefficient)
 		default:
 			out.supported = false
@@ -168,7 +184,6 @@ func fillCandidatePods(ready, seeds []*v1.Pod, wanted int) []*v1.Pod {
 }
 
 type prefixOnlyCandidateSeeder struct {
-	types.Router
 	seeder types.CandidateSeeder
 }
 
@@ -198,7 +213,7 @@ func fallbackBudgetCandidates(ctx *types.RoutingContext, src candidateSources, r
 	if src.prefixWeight == 0 {
 		return selectCandidates(ctx, nil, ready, k, 0)
 	}
-	return selectCandidates(ctx, prefixOnlyCandidateSeeder{seeder: src.seeder}, ready, (k+1)/2, k/2)
+	return selectCandidatesWithSeeder(ctx, prefixOnlyCandidateSeeder{seeder: src.seeder}, ready, (k+1)/2, k/2)
 }
 
 func candidateCapacities(c cache.Cache, pods []*v1.Pod) []float64 {
@@ -229,7 +244,34 @@ func candidateCapacities(c cache.Cache, pods []*v1.Pod) []float64 {
 }
 
 func budgetRecommendations(ctx *types.RoutingContext, src candidateSources, view *candidatePrefixView, scout []*v1.Pod, counts map[string]int, budget int) []*v1.Pod {
-	caps := candidateCapacities(src.cache, scout)
+	if budget <= 0 {
+		return nil
+	}
+	var recommendations []*v1.Pod
+	if src.kvWeight > 0 {
+		// KV occupancy need not correlate with request count or token rate.
+		// Give its objective a share of the small recommendation budget.
+		share := src.kvWeight / (src.kvWeight + src.loadWeight + src.requestWeight)
+		kvBudget := min(budget, int(math.Ceil(float64(budget)*share)))
+		scores, valid, err := least.NewLeastKvCacheScorer(src.cache).ScoreAll(ctx, &utils.PodArray{Pods: scout})
+		if err == nil {
+			for i := range scores {
+				valid[i] = valid[i] && scores[i] >= 0
+				if view != nil && src.otherWeight > 0 {
+					scores[i] /= 1 + .5*src.prefixWeight/src.otherWeight*view.fractions[scout[i]]
+				}
+			}
+			recommendations = routeutil.RankCandidates(scout, scores, valid, types.PolarityLeast, kvBudget)
+		}
+		if len(recommendations) == budget || src.loadWeight+src.requestWeight == 0 {
+			return recommendations
+		}
+	}
+	plainCounts := src.loadWeight == 0 && src.requestWeight > 0 && src.prefixWeight == 0
+	var caps []float64
+	if !plainCounts {
+		caps = candidateCapacities(src.cache, scout)
+	}
 	lb := loadBalanceRouter{cache: src.cache}
 	weight := src.otherWeight
 	if weight == 0 {
@@ -241,8 +283,11 @@ func budgetRecommendations(ctx *types.RoutingContext, src candidateSources, view
 		if !ok {
 			continue
 		}
-		used := 1 - lb.kvFreeFraction(ctx, p)
-		cost := (float64(n) + 1) / caps[i] * (1 + ctx.RoutingOverrides().LoadBalance.KVPressureAlpha*used*used)
+		cost := float64(n) + 1
+		if !plainCounts {
+			used := 1 - lb.kvFreeFraction(ctx, p)
+			cost = cost / caps[i] * (1 + ctx.RoutingOverrides().LoadBalance.KVPressureAlpha*used*used)
+		}
 		if view != nil && weight > 0 {
 			cost /= 1 + .5*src.prefixWeight/weight*view.fractions[p]
 		}
@@ -251,26 +296,49 @@ func budgetRecommendations(ctx *types.RoutingContext, src candidateSources, view
 		}
 		scores[i], valid[i] = cost, true
 	}
-	return routeutil.RankCandidates(scout, scores, valid, types.PolarityLeast, budget)
+	for _, pod := range routeutil.RankCandidates(scout, scores, valid, types.PolarityLeast, budget+len(recommendations)) {
+		duplicate := false
+		for _, p := range recommendations {
+			duplicate = duplicate || p == pod
+		}
+		if !duplicate {
+			recommendations = append(recommendations, pod)
+		}
+		if len(recommendations) == budget {
+			break
+		}
+	}
+	return recommendations
 }
 
 // selectBudgetCandidates uses only bounded local hint reads. Final live counts
 // and strategy scores are computed by the existing gate/router on its result.
 func selectBudgetCandidates(ctx *types.RoutingContext, router types.Router, ready []*v1.Pod, k int) []*v1.Pod {
-	if k <= 0 || len(ready) <= k || !candidateStageApplies(ctx) {
+	if k <= 0 {
+		return ready
+	}
+	if len(ready) <= k || !candidateStageApplies(ctx) {
+		recordCandidateSelection("bypass")
 		return ready
 	}
 	src := candidateRoutingSources(ctx, router)
-	if !src.supported || src.cache == nil || k < 4 {
+	if k < candidateRecommendationDivisor {
+		recordCandidateSelection("small_k")
 		return fallbackBudgetCandidates(ctx, src, ready, k)
 	}
-	if _, ok := src.cache.(cache.CachedRunningRequestHintProvider); !ok {
+	if !src.supported || src.cache == nil {
+		recordCandidateSelection("unsupported_strategy")
 		return fallbackBudgetCandidates(ctx, src, ready, k)
 	}
-	scout := sampleCandidatePods(ready, min(len(ready), 4*k))
-	counts := routeutil.SnapshotRequestHints(src.cache, scout)
-	if len(counts) == 0 {
-		return fallbackBudgetCandidates(ctx, src, ready, k)
+	scout := sampleCandidatePods(ready, min(len(ready), candidateScoutFactor*k))
+	needsCounts := src.kvWeight == 0 || src.loadWeight+src.requestWeight > 0
+	var counts map[string]int
+	if needsCounts {
+		counts = routeutil.SnapshotRequestHints(src.cache, scout)
+		if len(counts) == 0 {
+			recordCandidateSelection("no_hints")
+			return fallbackBudgetCandidates(ctx, src, ready, k)
+		}
 	}
 	view := readCandidatePrefix(ctx, src.prefix, ready)
 	var extra []*v1.Pod
@@ -287,18 +355,28 @@ func selectBudgetCandidates(ctx *types.RoutingContext, router types.Router, read
 			}
 		}
 	}
-	if len(extra) > 0 {
+	if needsCounts && len(extra) > 0 {
 		for key, n := range routeutil.SnapshotRequestHints(src.cache, extra) {
 			counts[key] = n
 		}
 	}
-	recommendations := budgetRecommendations(ctx, src, view, scout, counts, min(k/4, 4))
+	recommendations := budgetRecommendations(ctx, src, view, scout, counts, candidateRecommendationBudget(k))
 	if len(recommendations) == 0 {
+		recordCandidateSelection("no_valid_recommendation")
 		return fallbackBudgetCandidates(ctx, src, ready, k)
 	}
+	recordCandidateSelection("recommended")
+	return fillCandidatePods(ready, budgetCandidateSeeds(k, recommendations, view), k)
+}
+
+func candidateRecommendationBudget(k int) int {
+	return min(k/candidateRecommendationDivisor, candidateRecommendationCap)
+}
+
+func budgetCandidateSeeds(k int, recommendations []*v1.Pod, view *candidatePrefixView) []*v1.Pod {
 	// Once the cost recommendation cap saturates, preserve prefix coverage as
 	// K grows rather than giving every extra slot to uniform random sampling.
-	prefixBudget := max(0, k/2-4*len(recommendations))
+	prefixBudget := max(0, k/2-candidatePrefixSlotsPerRecommendation*len(recommendations))
 	seeds := append([]*v1.Pod(nil), recommendations...)
 	if view != nil && prefixBudget > 0 {
 		for _, p := range view.seeds(prefixBudget + len(recommendations)) {
@@ -317,5 +395,5 @@ func selectBudgetCandidates(ctx *types.RoutingContext, router types.Router, read
 			}
 		}
 	}
-	return fillCandidatePods(ready, seeds, k)
+	return seeds
 }

@@ -109,24 +109,6 @@ func (r leastKvCacheRouter) Polarity() types.Polarity {
 	return types.PolarityLeast
 }
 
-// SeedCandidates uses only locally cached KV metrics; missing or non-finite
-// metrics leave the slot available for another strategy or random sampling.
-func (r leastKvCacheRouter) SeedCandidates(ctx *types.RoutingContext, ready types.PodList, max int) []*v1.Pod {
-	if max <= 0 || ctx.RoutingOverrides().Candidate.LegacyPrefixM {
-		return nil
-	}
-	scores, scored, err := r.ScoreAll(ctx, ready)
-	if err != nil {
-		return nil
-	}
-	for i := range scores {
-		if scores[i] < 0 {
-			scored[i] = false
-		}
-	}
-	return routeutil.RankCandidates(ready.All(), scores, scored, r.Polarity(), max)
-}
-
 func (r leastKvCacheRouter) Route(ctx *types.RoutingContext, readyPodList types.PodList) (string, error) {
 	targetPod, err := routeutil.RouteByScore(ctx, readyPodList, r)
 	if err != nil {

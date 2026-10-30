@@ -22,37 +22,15 @@ import (
 	"sort"
 
 	"github.com/vllm-project/aibrix/pkg/cache"
-	"github.com/vllm-project/aibrix/pkg/metrics"
 	"github.com/vllm-project/aibrix/pkg/types"
 	"github.com/vllm-project/aibrix/pkg/utils"
 	v1 "k8s.io/api/core/v1"
 )
 
-// CachedRequestHints reads approximate, locally cached counts without Redis.
-// The metric can be stale or reflect only this gateway between refreshes. It is
-// suitable only for candidate hints, never final scoring or admission. In
-// particular, do not feed it through RoutingContext.RunningRequests: that would
-// contaminate the live-count snapshot. Unknown/invalid hints are omitted.
-func CachedRequestHints(c cache.Cache, pods []*v1.Pod) map[string]int {
-	counts := make(map[string]int, len(pods))
-	for _, pod := range pods {
-		v, err := c.GetMetricValueByPod(pod.Name, pod.Namespace, metrics.RealtimeNumRequestsRunning)
-		if err != nil || v == nil {
-			continue
-		}
-		n := v.GetSimpleValue()
-		if math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n > math.MaxInt32 {
-			continue
-		}
-		counts[utils.GeneratePodKey(pod.Namespace, pod.Name)] = int(math.Ceil(n))
-	}
-	return counts
-}
-
 // SnapshotRequestHints uses an explicitly observed count source. It does not
 // fall back to the metric slot: that slot may have lost remote contributions.
-// Missing or expired observations stay unknown. This is an experimental source
-// for candidate selection; final live scoring and admission remain separate.
+// Missing or expired observations stay unknown. Candidate observations remain
+// separate from final live scoring and admission.
 func SnapshotRequestHints(c cache.Cache, pods []*v1.Pod) map[string]int {
 	provider, ok := c.(cache.CachedRunningRequestHintProvider)
 	if !ok {

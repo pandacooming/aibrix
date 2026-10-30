@@ -191,16 +191,17 @@ Off by default (`K=0`). With only `AIBRIX_ROUTING_CANDIDATE_K` or
 Up to min(floor(K/4), 4) candidates are recommended from a bounded scout pool
 using observed counts, capacity and KV pressure. Larger K also retains a
 prefix reserve; other slots are sampled uniformly without replacement. Missing
-or stale observations use the reference random/prefix policy, which can return
+or stale count observations use the reference random/prefix policy for strategies
+that need counts; pure KV selection uses its cached KV metrics. Fallback can return
 fewer than K candidates. K<4 uses the reference. See the
 [candidate selection design](algorithms/candidate_selection.md).
 
-Load-balance, least-request, least-kv-cache and prefix-cache blends use at most
+Count-dependent load-balance, least-request and prefix-cache blends use at most
 5K locally cached count hints. Remote contributions remain separate from live
 local atomics. Changed source generations establish reader-local age bounds;
 unchanged rows do not renew them. The existing background snapshot sync does
 lazy extra local aggregation; it adds no timer or Redis command. Missing Redis
-or expired hints trigger reference selection. Final scoring/admission retain
+or expired hints trigger reference selection for these objectives. Final scoring/admission retain
 the original live-count APIs. Prefix-index work and existing fleet-wide
 prefilters may still scale with N; total routing CPU is not independent of N.
 
@@ -215,7 +216,7 @@ on the candidate pool.
 
 `prefixM` and `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` are deprecated. If either is
 **explicitly set**, including zero, the existing K-random-plus-M-prefix policy
-is retained and the new load/KV seeders stay off. An explicitly configured
+is retained and central recommendations stay off. An explicitly configured
 process M is inherited by model profiles. Remove it at the process level to
 use the new K-only policy; move M into individual legacy profiles first if
 migrating one model at a time. There is no new mode or seed-size parameter.
@@ -236,6 +237,8 @@ Model profiles use `routingConfig.candidate.k` and the deprecated
 `routingConfig.candidate.prefixM`; see [Model Config Profile Overrides](#model-config-profile-overrides).
 
 ---
+
+Pure `least-kv-cache` recommends by GPU + CPU KV usage and does not require running-count hints. In blends, KV receives its weighted share of recommendation slots. `aibrix_routing_candidate_selections_total{path}` exposes recommended/fallback paths; a one-time INFO log announces K-only mode and the migration from implicit M=16. See the design for path labels and reproducible source/quality probes.
 
 ## External Replica Router (`algorithms/external*.go`)
 

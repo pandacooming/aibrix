@@ -19,7 +19,6 @@ package routingalgorithms
 import (
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"strings"
 	"testing"
 
@@ -39,7 +38,6 @@ type budgetHintCache struct {
 	cache.Cache
 	hints                                                map[string]int64
 	hintPods, metricReads, rawReads, liveReads, livePods int
-	allowRaw                                             bool
 }
 
 func (c *budgetHintCache) GetCachedRunningRequestHints(pods []*v1.Pod) map[string]int64 {
@@ -55,7 +53,7 @@ func (c *budgetHintCache) GetCachedRunningRequestHints(pods []*v1.Pod) map[strin
 }
 func (c *budgetHintCache) GetMetricValueByPod(name, namespace, metric string) (metrics.MetricValue, error) {
 	c.metricReads++
-	if metric == metrics.RealtimeNumRequestsRunning && !c.allowRaw {
+	if metric == metrics.RealtimeNumRequestsRunning {
 		c.rawReads++
 		return nil, fmt.Errorf("unscoped count slot is forbidden")
 	}
@@ -247,10 +245,9 @@ func BenchmarkNativeCandidateBudget(b *testing.B) {
 	silenceKlog(b)
 	for _, n := range []int{50, 500, 2000} {
 		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
-			for _, mode := range []string{"random", "ranked-draft", "native"} {
+			for _, mode := range []string{"random", "native"} {
 				b.Run(mode, func(b *testing.B) {
 					c, pods := newBudgetHintCache(b, n)
-					c.allowRaw = true
 					for i, p := range pods {
 						c.hints[utils.GeneratePodKey(p.Namespace, p.Name)] = int64(i % 17)
 					}
@@ -262,57 +259,10 @@ func BenchmarkNativeCandidateBudget(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						if mode == "ranked-draft" {
-							_ = selectRankedCandidates(ctx, router, pods, 16)
-						} else {
-							_ = SelectCandidates(ctx, router, pods)
-						}
+						_ = SelectCandidates(ctx, router, pods)
 					}
 				})
 			}
 		})
 	}
-}
-
-// selectRankedCandidates preserves the original draft rule for local comparison.
-func selectRankedCandidates(ctx *types.RoutingContext, router types.Router, ready []*v1.Pod, k int) []*v1.Pod {
-	if k <= 0 || len(ready) <= k || !candidateStageApplies(ctx) {
-		return ready
-	}
-	candidates := make([]*v1.Pod, 0, k)
-	picked := make(map[*v1.Pod]struct{}, k)
-	seedBudget := k / 2
-	if seeder, ok := router.(types.CandidateSeeder); ok && seedBudget > 0 {
-		for _, pod := range seeder.SeedCandidates(ctx, &utils.PodArray{Pods: ready}, seedBudget) {
-			if len(candidates) == seedBudget {
-				break
-			}
-			if pod != nil {
-				if _, exists := picked[pod]; !exists {
-					picked[pod] = struct{}{}
-					candidates = append(candidates, pod)
-				}
-			}
-		}
-	}
-	if 2*k > len(ready) {
-		for _, i := range rand.Perm(len(ready)) {
-			if _, exists := picked[ready[i]]; !exists {
-				picked[ready[i]] = struct{}{}
-				candidates = append(candidates, ready[i])
-				if len(candidates) == k {
-					break
-				}
-			}
-		}
-	} else {
-		for len(candidates) < k {
-			pod := ready[rand.IntN(len(ready))]
-			if _, exists := picked[pod]; !exists {
-				picked[pod] = struct{}{}
-				candidates = append(candidates, pod)
-			}
-		}
-	}
-	return candidates
 }
