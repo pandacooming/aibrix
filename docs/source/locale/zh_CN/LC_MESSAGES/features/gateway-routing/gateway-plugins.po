@@ -1523,22 +1523,8 @@ msgid "``AIBRIX_ROUTING_CANDIDATE_K``"
 msgstr "``AIBRIX_ROUTING_CANDIDATE_K``"
 
 #: ../../source/features/gateway-routing/gateway-plugins.rst:698
-msgid ""
-"Number of ready pods drawn at random for the load-imbalance gate and the "
-"router to score, so each request reads per-pod load for about ``k`` pods "
-"instead of all of them. ``0`` scores every ready pod. Applies only when "
-"every resolved strategy is candidate-safe (see "
-"``pkg/plugins/gateway/ENV_VARS.md``). Checks that compare a pod with the "
-"rest of its pool, such as the gate's spread, the prefix-cache standard-"
-"deviation check and blend normalization, then compare it with the sample."
-" Use at least ``2``: with ``1`` and no seeded pods, the one sampled pod "
-"is routed to without scoring."
-msgstr ""
-"为负载不均衡闸门和路由器随机抽取、用于打分的就绪 Pod 数量，这样每个请求只需读取约 ``k`` 个 Pod "
-"的负载，而不是全部 Pod。 ``0`` 表示对所有就绪 Pod 打分。仅当解析出的每个策略都是候选安全的策略时才生效（参见 "
-"``pkg/plugins/gateway/ENV_VARS.md`` ）。将某个 Pod 与其所在池中其他 Pod 比较的检查，例如闸门的离散度、"
-"prefix-cache 的标准差检查以及混合策略的归一化，此时比较的是抽样集合。取值至少为 ``2`` ：取 ``1`` "
-"且没有种子 Pod 时，唯一被抽中的 Pod 会不经打分直接被选中。"
+msgid "Total candidate budget when prefixM is not explicitly configured. Bounded scouting combines observed load hints with prefix matches, retains a prefix reserve as K grows, and fills remaining slots randomly. Missing or expired hints use the reference random/prefix policy, which can return fewer than K pods. Final scoring uses live counts on the selected pods. Load-hint reads cover at most 5K pods; prefix-index lookup and the full-fleet requestsInflight prefilter can still scale with fleet size. ``0`` disables selection; ``1`` is a random pick. Strategy-safety checks are unchanged."
+msgstr "未显式配置 prefixM 时的候选总预算。有界预选结合带时效约束的负载提示与前缀匹配；K 增大时保留部分前缀候选，其余名额随机补足。提示缺失或过期时沿用原有随机/前缀策略，此时实际数量可能少于 K。最终评分读取所选 Pod 的实时计数。负载提示最多读取 5K 个 Pod；前缀索引查询和 requestsInflight 全量预过滤仍可能随集群规模增长。``0`` 禁用候选选择；``1`` 为随机选择。策略安全检查保持不变。"
 
 #: ../../source/features/gateway-routing/gateway-plugins.rst:699
 msgid "``candidate.prefixM``"
@@ -1549,10 +1535,8 @@ msgid "``AIBRIX_ROUTING_CANDIDATE_PREFIX_M``"
 msgstr "``AIBRIX_ROUTING_CANDIDATE_PREFIX_M``"
 
 #: ../../source/features/gateway-routing/gateway-plugins.rst:701
-msgid ""
-"Most pods the router may add to the sample; for ``prefix-cache`` these "
-"are the pods holding the longest cached prefix of the prompt."
-msgstr "路由器最多可向抽样集合中添加的 Pod 数量；对于 ``prefix-cache`` ，这些是缓存了提示词最长前缀的 Pod。"
+msgid "Deprecated. An explicit value, including zero, retains legacy K random pods plus up to M prefix holders. If M was previously implicit, old K-only deployments must set M=16 explicitly to preserve the old policy, or omit M and increase K to preserve the maximum total budget. Remove any process-wide M before migrating profiles to K-only selection. See the candidate-stage migration guide in ``pkg/plugins/gateway/ENV_VARS.md``."
+msgstr "已弃用。显式设置（包括零）将保留 K 个随机 Pod 加最多 M 个前缀缓存持有者的旧策略。此前依赖隐式 M 的仅 K 配置，需要显式设置 M=16 以保留旧策略，或省略 M 并增大 K 以保留候选数量上限。按模型迁移到仅 K 配置前，需先移除进程级 M。迁移说明见 ``pkg/plugins/gateway/ENV_VARS.md`` 的候选阶段章节。"
 
 #: ../../source/features/gateway-routing/gateway-plugins.rst:687
 msgid "VTC fairness"

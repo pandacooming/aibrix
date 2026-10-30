@@ -73,7 +73,9 @@ type RoutingConfig struct {
 // CandidateProfileConfig mirrors AIBRIX_ROUTING_CANDIDATE_K and
 // AIBRIX_ROUTING_CANDIDATE_PREFIX_M.
 type CandidateProfileConfig struct {
-	K       *int `json:"k,omitempty"`
+	K *int `json:"k,omitempty"`
+	// Deprecated: an explicit PrefixM retains legacy K+M selection. Omit it to
+	// use K as the total budget across all candidate-seeding strategies.
 	PrefixM *int `json:"prefixM,omitempty"`
 }
 

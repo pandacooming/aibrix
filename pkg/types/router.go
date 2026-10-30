@@ -32,15 +32,22 @@ type SingleCandidateBypasser interface {
 	BypassSingleCandidate() bool
 }
 
-// CandidateSeeder is implemented by routers whose choice depends on particular pods, such as
-// the pods holding a request's prefix. When the gateway routes over a bounded candidate set
-// (AIBRIX_ROUTING_CANDIDATE_K), it adds the pods SeedCandidates returns to that set, so a
-// candidate stage never hides them from the router.
+// CandidateSeeder provides cheap, ranked candidate hints, such as prefix holders
+// or pods with low cached load. A hint is not a guaranteed final candidate;
+// bounded selection combines raw hints before final live scoring.
+// Explicit legacy prefixM keeps the previous additive prefix-seed policy.
 type CandidateSeeder interface {
 	// SeedCandidates returns at most max pods from readyPods, best first. It must not read
 	// per-pod state from Redis, because the candidate stage exists to avoid reads over every
 	// ready pod.
 	SeedCandidates(ctx *RoutingContext, readyPods PodList, max int) []*v1.Pod
+}
+
+// CandidateScorer supplies unnormalized candidate-stage scores. Implementations
+// may remember request-local raw observations for later ScoreAll calls; final
+// pool-dependent normalization must still run on the final candidate subset.
+type CandidateScorer interface {
+	ScoreCandidates(ctx *RoutingContext, readyPods PodList) ([]float64, []bool, error)
 }
 
 // QueueRouter defines the interface for routers that contains built-in queue and

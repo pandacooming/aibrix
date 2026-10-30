@@ -186,33 +186,54 @@ The four `AIBRIX_ROUTING_AUTO_BLEND_*` weights can also be set per request by th
 
 ## Candidate Stage (`algorithms/candidates.go`)
 
-Off by default. When `AIBRIX_ROUTING_CANDIDATE_K` is above 0, `selectTargetPod` narrows the ready
-pods to K pods drawn uniformly at random, plus up to `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` pods the
-router seeds, before the load-imbalance gate and the router run. `prefix-cache` seeds the pods
-holding the longest cached prefix of the request, so cache affinity is kept. The gate and every
-strategy then read running counts, from Redis when it is configured, for those pods only, which
-bounds the per-request routing work by K + M instead of the number of ready pods (RFC #3188).
+Off by default (`K=0`). With only `AIBRIX_ROUTING_CANDIDATE_K` or
+`routingConfig.candidate.k` configured, K is the **total** candidate budget.
+Up to min(floor(K/4), 4) candidates are recommended from a bounded scout pool
+using observed counts, capacity and KV pressure. Larger K also retains a
+prefix reserve; other slots are sampled uniformly without replacement. Missing
+or stale observations use the reference random/prefix policy, which can return
+fewer than K candidates. K<4 uses the reference. See the
+[candidate selection design](algorithms/candidate_selection.md).
 
-The stage applies only when every strategy in the resolved strategy, including the auto-blend,
-is candidate-safe: it judges pods only by the pods it is given, with no fleet-wide state of its
-own. These are `least-request`, `least-request-top-k`, `load-balance`, `prefix-cache`, `random`,
-`power-of-two` and the other `least-*` strategies. Any other strategy, such as `vtc-basic`,
-`session-affinity`, the queue router, `external`, `throughput`, `pd` or `slo*`, keeps every ready
-pod. It also does nothing when K plus the pods the router seeds is at least the number of ready pods. When a per-replica
-inflight cap is set, its saturation filter still runs over every ready pod first.
+Load-balance, least-request, least-kv-cache and prefix-cache blends use at most
+5K locally cached count hints. Remote contributions remain separate from live
+local atomics. Changed source generations establish reader-local age bounds;
+unchanged rows do not renew them. The existing background snapshot sync does
+lazy extra local aggregation; it adds no timer or Redis command. Missing Redis
+or expired hints trigger reference selection. Final scoring/admission retain
+the original live-count APIs. Prefix-index work and existing fleet-wide
+prefilters may still scale with N; total routing CPU is not independent of N.
 
-The scoring formulas are unchanged, but checks that compare a pod with the rest of its pool now
-compare it with the sample: the load-imbalance gate's spread, `prefix-cache`'s standard-deviation
-check, and the blend's min-max normalization and winsorizing. Use K of at least 2. With K = 1 and
-no seeded pods, the set has one pod, and the gateway routes to it without scoring, which is a
-random pick.
+The allowlist and automatic-blend safety checks are unchanged. Global-view,
+exclusive, queue, session-affinity, external and throughput routers keep every
+ready pod. A `requestsInflight` saturation prefilter still reads all ready pods
+before selection, so the total Redis reads are not K-bounded with that cap set.
+The gate, prefix standard-deviation check and blend normalization still operate
+on the candidate pool.
+
+### Migration from K+M
+
+`prefixM` and `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` are deprecated. If either is
+**explicitly set**, including zero, the existing K-random-plus-M-prefix policy
+is retained and the new load/KV seeders stay off. An explicitly configured
+process M is inherited by model profiles. Remove it at the process level to
+use the new K-only policy; move M into individual legacy profiles first if
+migrating one model at a time. There is no new mode or seed-size parameter.
+
+**Behavior change for existing K-only deployments:** the previous implicit
+M=16 is no longer added. For example, old K=16 without an explicit M could
+score up to 32 pods; new K=16 scores at most 16. Set M=16 explicitly to retain
+the old policy, or remove M and choose K=32 for the same maximum total budget
+under the new policy. Matching total budgets does not imply identical routing
+quality; candidate composition also changes. K=0 remains disabled in both paths.
 
 | Variable | Type | Default | Description | Source |
 |---|---|---|---|---|
-| `AIBRIX_ROUTING_CANDIDATE_K` | int | `0` | Number of ready pods, drawn at random, that the gate and the router consider. `0` disables the candidate stage. | [algorithms/candidates.go](algorithms/candidates.go) |
-| `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` | int | `16` | Maximum number of pods the router may seed into the candidate set on top of the K random pods. A hot prefix is held by more pods in a larger fleet, and the router can only prefer the least loaded of the holders it is given, so keep this near K. `0` or a negative value turns seeding off. | [algorithms/candidates.go](algorithms/candidates.go) |
+| `AIBRIX_ROUTING_CANDIDATE_K` | int | `0` | Total candidate budget when M is unset; random slots under explicit legacy M. `0` disables selection. | [algorithms/candidates.go](algorithms/candidates.go) |
+| `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` | int | unset | Deprecated legacy selector and extra prefix slots. An explicit zero disables legacy seeding; a negative env value is clamped to zero. The old fallback value 16 is ignored unless M is explicit. | [algorithms/candidates.go](algorithms/candidates.go) |
 
-Both can also be set per request by the model config profile (`routingConfig.candidate.*`); see [Model Config Profile Overrides](#model-config-profile-overrides).
+Model profiles use `routingConfig.candidate.k` and the deprecated
+`routingConfig.candidate.prefixM`; see [Model Config Profile Overrides](#model-config-profile-overrides).
 
 ---
 
@@ -455,8 +476,8 @@ description and examples live in the Config Profiles section of the gateway plug
 | `AIBRIX_ROUTING_AUTO_BLEND_LEAST_REQUEST_WEIGHT` | `routingConfig.autoBlend.leastRequestWeight` | |
 | `AIBRIX_ROUTING_AUTO_BLEND_PREFIX_CACHE_WEIGHT` | `routingConfig.autoBlend.prefixCacheWeight` | `0` is rejected with a warning and the environment value is kept; it would drop the caller's own strategy from the blend. |
 | `AIBRIX_ROUTING_AUTO_BLEND_PREFIX_CACHE_LOAD_BALANCE_WEIGHT` | `routingConfig.autoBlend.prefixCacheLoadBalanceWeight` | `0` leaves those requests with prefix-cache scoring alone. |
-| `AIBRIX_ROUTING_CANDIDATE_K` | `routingConfig.candidate.k` | `0` disables the candidate stage for the profile's requests. |
-| `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` | `routingConfig.candidate.prefixM` | `0` turns seeding off. |
+| `AIBRIX_ROUTING_CANDIDATE_K` | `routingConfig.candidate.k` | Total candidate budget when M is unset. `0` disables the stage. |
+| `AIBRIX_ROUTING_CANDIDATE_PREFIX_M` | `routingConfig.candidate.prefixM` | Deprecated; an explicit value preserves legacy K+M. `0` disables legacy seeding. |
 | `AIBRIX_ROUTER_VTC_BASIC_INPUT_TOKEN_WEIGHT` | `routingConfig.vtc.inputTokenWeight` | Also scopes the VTC token tracker: this weight is baked into the tracker, so the profile's requests get one of their own. |
 | `AIBRIX_ROUTER_VTC_BASIC_OUTPUT_TOKEN_WEIGHT` | `routingConfig.vtc.outputTokenWeight` | Scopes the tracker the same way as the input weight. |
 | `AIBRIX_ROUTER_VTC_TOKEN_TRACKER_WINDOW_SIZE` | `routingConfig.vtc.tokenTrackerWindowSize` | Sliding window of the profile's tracker, in `tokenTrackerTimeUnit` units. |

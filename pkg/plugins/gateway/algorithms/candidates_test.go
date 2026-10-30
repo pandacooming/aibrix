@@ -213,6 +213,9 @@ func TestMultiStrategySeedCandidatesCapsAtMax(t *testing.T) {
 		},
 	}
 	ctx := &types.RoutingContext{}
+	legacy := *types.DefaultRoutingOverrides()
+	legacy.Candidate.LegacyPrefixM = true
+	ctx.SetRoutingOverrides(&legacy)
 	assert.Equal(t, pods[:4], m.SeedCandidates(ctx, nil, 4))
 	assert.Equal(t, pods[:8], m.SeedCandidates(ctx, nil, 8))
 	assert.Empty(t, m.SeedCandidates(ctx, nil, 0))

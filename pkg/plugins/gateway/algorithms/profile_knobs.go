@@ -80,8 +80,9 @@ func processRoutingOverrides() *types.RoutingOverrides {
 		},
 		PD: pdrouter.EnvOverrides(),
 		Candidate: types.CandidateOverrides{
-			K:       routingCandidateK,
-			PrefixM: routingCandidatePrefixM,
+			K:             routingCandidateK,
+			PrefixM:       routingCandidatePrefixM,
+			LegacyPrefixM: routingCandidatePrefixMConfigured,
 		},
 	}
 }
@@ -151,7 +152,10 @@ func resolveRoutingOverrides(cfg *types.RoutingConfig) *types.RoutingOverrides {
 	}
 	if c := cfg.Candidate; c != nil {
 		set(apply(&ov.Candidate.K, "candidate.k", c.K, nonNegative[int]))
-		set(apply(&ov.Candidate.PrefixM, "candidate.prefixM", c.PrefixM, nonNegative[int]))
+		if apply(&ov.Candidate.PrefixM, "candidate.prefixM", c.PrefixM, nonNegative[int]) { //nolint:staticcheck // Explicit prefixM preserves the deprecated K+M policy during migration.
+			ov.Candidate.LegacyPrefixM = true
+			set(true)
+		}
 	}
 	set(applyAny(&ov.PD.PromptLengthBucketing, cfg.PromptLengthBucketing))
 	set(applyAny(&ov.PD.BucketServe, cfg.BucketServe))

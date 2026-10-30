@@ -18,6 +18,8 @@ package routingalgorithms
 
 import (
 	"math/rand/v2"
+	"strconv"
+	"sync"
 
 	"github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms/least"
 	"github.com/vllm-project/aibrix/pkg/types"
@@ -26,17 +28,26 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// The candidate stage (RFC #3188) bounds the per-request routing work by K instead of the number
-// of ready pods. Every strategy and the load-imbalance gate read each pod's cross-gateway running
-// count from Redis, so routing over N pods costs several N-pod Redis reads per request. With
-// AIBRIX_ROUTING_CANDIDATE_K > 0, the gateway draws K pods at random, adds up to
-// AIBRIX_ROUTING_CANDIDATE_PREFIX_M pods that the router seeds (for prefix-cache, the pods holding
-// the longest cached prefix), and runs the gate and the router on that set only. Off by default;
-// a model config profile can set both through routingConfig.candidate.
+// Candidate routing (RFC #3188) is off by default. K-only configuration uses a
+// total K-pod budget: bounded cost recommendations, a prefix reserve when K
+// grows, and uniform exploration. Live counts cover only these candidates;
+// cached load-hint reads are bounded by K. Explicit M keeps
+// the deprecated K random + M prefix-seed policy during migration.
 var (
-	routingCandidateK       = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_K", 0)
-	routingCandidatePrefixM = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_PREFIX_M", 16)
+	routingCandidateK                 = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_K", 0)
+	routingCandidatePrefixM           = utils.LoadEnvInt("AIBRIX_ROUTING_CANDIDATE_PREFIX_M", 16)
+	routingCandidatePrefixMConfigured = legacyPrefixMConfigured()
+	legacyCandidateWarning            sync.Once
 )
+
+func legacyPrefixMConfigured() bool {
+	value, ok := utils.LookupEnv("AIBRIX_ROUTING_CANDIDATE_PREFIX_M")
+	if !ok || value == "" {
+		return false
+	}
+	_, err := strconv.Atoi(value)
+	return err == nil
+}
 
 // candidateSafeStrategies are the strategies whose choice depends only on the pods they are
 // given, so routing over a sample changes which pods compete but not the formulas that judge
@@ -80,11 +91,24 @@ func candidateStageApplies(ctx *types.RoutingContext) bool {
 
 // SelectCandidates returns the pods the gate and router should consider for this request: all of
 // readyPods when the candidate stage is off, does not apply to the strategy, or would not shrink
-// the set; otherwise K pods drawn uniformly at random plus up to M pods the router seeds. It reads
+// the set; otherwise a total K-pod set, or legacy K+M when M is explicit. It reads
 // no per-pod state from Redis. router is the one Select returned for ctx.
 func SelectCandidates(ctx *types.RoutingContext, router types.Router, readyPods []*v1.Pod) []*v1.Pod {
 	knobs := ctx.RoutingOverrides().Candidate
+	if !knobs.LegacyPrefixM {
+		return selectUnifiedCandidates(ctx, router, readyPods, knobs.K)
+	}
+	legacyCandidateWarning.Do(func() {
+		klog.Warning("candidate.prefixM / AIBRIX_ROUTING_CANDIDATE_PREFIX_M is deprecated; explicit M preserves legacy K+M routing; omit M and configure a total K budget to migrate")
+	})
 	return selectCandidates(ctx, router, readyPods, knobs.K, knobs.PrefixM)
+}
+
+// selectUnifiedCandidates uses the observed-hint budget policy. Unknown hints
+// retain the reference sampling distribution; final scoring still reads live
+// counts, on these candidates only.
+func selectUnifiedCandidates(ctx *types.RoutingContext, router types.Router, ready []*v1.Pod, k int) []*v1.Pod {
+	return selectBudgetCandidates(ctx, router, ready, k)
 }
 
 func selectCandidates(ctx *types.RoutingContext, router types.Router, readyPods []*v1.Pod, k, m int) []*v1.Pod {

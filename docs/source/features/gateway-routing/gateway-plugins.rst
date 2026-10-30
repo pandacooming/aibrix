@@ -695,10 +695,10 @@ Candidate stage
      - Description
    * - ``candidate.k``
      - ``AIBRIX_ROUTING_CANDIDATE_K``
-     - Number of ready pods drawn at random for the load-imbalance gate and the router to score, so each request reads per-pod load for about ``k`` pods instead of all of them. ``0`` scores every ready pod. Applies only when every resolved strategy is candidate-safe (see ``pkg/plugins/gateway/ENV_VARS.md``). Checks that compare a pod with the rest of its pool, such as the gate's spread, the prefix-cache standard-deviation check and blend normalization, then compare it with the sample. Use at least ``2``: with ``1`` and no seeded pods, the one sampled pod is routed to without scoring.
+     - Total candidate budget when prefixM is not explicitly configured. Bounded scouting combines observed load hints with prefix matches, retains a prefix reserve as K grows, and fills remaining slots randomly. Missing or expired hints use the reference random/prefix policy, which can return fewer than K pods. Final scoring uses live counts on the selected pods. Load-hint reads cover at most 5K pods; prefix-index lookup and the full-fleet requestsInflight prefilter can still scale with fleet size. ``0`` disables selection; ``1`` is a random pick. Strategy-safety checks are unchanged.
    * - ``candidate.prefixM``
      - ``AIBRIX_ROUTING_CANDIDATE_PREFIX_M``
-     - Most pods the router may add to the sample; for ``prefix-cache`` these are the pods holding the longest cached prefix of the prompt.
+     - Deprecated. An explicit value, including zero, retains legacy K random pods plus up to M prefix holders. If M was previously implicit, old K-only deployments must set M=16 explicitly to preserve the old policy, or omit M and increase K to preserve the maximum total budget. Remove any process-wide M before migrating profiles to K-only selection. See the candidate-stage migration guide in ``pkg/plugins/gateway/ENV_VARS.md``.
 
 VTC fairness
 ~~~~~~~~~~~~

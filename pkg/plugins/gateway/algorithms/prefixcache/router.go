@@ -207,6 +207,18 @@ type prefixCacheRouter struct {
 	kvSyncRouter *kvSyncPrefixCacheRouter
 }
 
+func (p prefixCacheRouter) Cache() cache.Cache        { return p.cache }
+func (k *kvSyncPrefixCacheRouter) Cache() cache.Cache { return k.cache }
+
+// ScoreCandidates exposes the raw prefix values used by candidate selection.
+func (p prefixCacheRouter) ScoreCandidates(ctx *types.RoutingContext, ready types.PodList) ([]float64, []bool, error) {
+	return p.scoreAll(ctx, ready, true)
+}
+
+func (k *kvSyncPrefixCacheRouter) ScoreCandidates(ctx *types.RoutingContext, ready types.PodList) ([]float64, []bool, error) {
+	return k.scoreAll(ctx, ready, true)
+}
+
 // TokenizerPoolInterface defines the interface for tokenizer pools
 type TokenizerPoolInterface interface {
 	GetTokenizer(model string, pods []*v1.Pod) tokenizer.Tokenizer

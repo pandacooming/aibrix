@@ -71,7 +71,7 @@ func TestSelectTargetPodClearsSeededPrefixMatch(t *testing.T) {
 	defer ctx.Delete()
 	zero, two := 0, 2
 	ctx.ConfigProfile = &types.ResolvedConfigProfile{Routing: &types.RoutingConfig{
-		Candidate: &types.CandidateProfileConfig{K: &two, PrefixM: &two},
+		Candidate: &types.CandidateProfileConfig{K: &two, PrefixM: &two}, //nolint:staticcheck // Verify explicit legacy prefixM still shares seeded results.
 		AutoBlend: &types.AutoBlendProfileConfig{LoadBalanceWeight: &zero, LeastRequestWeight: &zero},
 	}}
 	for _, routeErr := range []error{nil, errors.New("routing failed")} {

@@ -70,6 +70,28 @@ func TestSeededPrefixMatchSharesRawScores(t *testing.T) {
 	}
 }
 
+// The unified budget consumes raw scores rather than the old ranked seed
+// list. It must retain the same observation for final subset scoring.
+func TestCandidateScoresRememberRawMatches(t *testing.T) {
+	for _, kvSync := range []bool{false, true} {
+		t.Run(fmt.Sprintf("kvSync=%v", kvSync), func(t *testing.T) {
+			r, all := newSeededMatchRouter(t, 3, kvSync)
+			prompt := strings.Repeat("candidate raw score reuse ", 64)
+			addSeededMatch(t, r, all, all.Pods[0], prompt)
+			ctx := newSeededMatchContext(prompt)
+			defer ctx.Delete()
+			before, _, err := r.ScoreCandidates(ctx, all)
+			require.NoError(t, err)
+			require.NotNil(t, ctx.SeededPrefixMatch())
+			addSeededMatch(t, r, all, all.Pods[1], prompt)
+			subset := &utils.PodArray{Pods: []*v1.Pod{all.Pods[1], all.Pods[0]}}
+			after, _, err := r.ScoreAll(ctx, subset)
+			require.NoError(t, err)
+			require.Equal(t, []float64{before[1], before[0]}, after, "candidate scoring must prevent a second live index observation")
+		})
+	}
+}
+
 func TestSeededPrefixMatchPreservesAdmissionAndPrefixCredit(t *testing.T) {
 	for _, kvSync := range []bool{false, true} {
 		t.Run(fmt.Sprintf("kvSync=%v", kvSync), func(t *testing.T) {

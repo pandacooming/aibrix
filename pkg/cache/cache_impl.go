@@ -252,6 +252,8 @@ func (c *Store) realtimeRunningRequests(pod *Pod) int64 {
 // That slot is a periodically synced cache of this same count and is overwritten by this
 // gateway's local atomic on request start/end (cache_trace.go). Between scrape ticks it
 // is this gateway's local view, not the live cross-gateway total.
+// Candidate seeding may use that slot only as an approximate hint; final scoring
+// and admission must use the live APIs below.
 //
 // Source: Redis hash summed over currently-live gateways (cache_running_requests.go).
 // Crashed-gateway leftovers age out with runningRequestsLivenessWindow; they do not leak.

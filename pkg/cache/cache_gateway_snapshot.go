@@ -71,6 +71,7 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 	if store.redisClient == nil {
 		return
 	}
+	selfGateway := gatewayPodName
 	ticker := time.NewTicker(gatewaySnapshotSyncInterval)
 	errLog := store.gatewaySnapshotErrorLog
 	if errLog == nil {
@@ -83,6 +84,7 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 		// disturbing any other key aggregated under the same pod (see the read
 		// phase below).
 		var prevRaw map[string]map[string]string
+		observations := make(candidateObservationTracker)
 		for {
 			select {
 			case <-ticker.C:
@@ -96,7 +98,7 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 					// Phase 1 (write): push all pods' snapshots in one pipeline.
 					writePipe := store.redisClient.Pipeline()
 					store.metaPods.Range(func(_ string, pod *Pod) bool {
-						appendGatewayPodSnapshotToPipeline(ctx, writePipe, pod)
+						appendGatewayPodSnapshotForGateway(ctx, writePipe, pod, selfGateway)
 						return true
 					})
 					if _, err := writePipe.Exec(ctx); err != nil {
@@ -118,7 +120,14 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 
 					// Phase 2 (read): fetch every key's fields, falling back to prevRaw's last known value
 					// for exactly the keys that could not be read (see readGatewaySnapshots).
-					newRaw, unread, readErr := readGatewaySnapshots(ctx, store.redisClient, allKeys, prevRaw)
+					collectHints := store.candidateHintsRequested.Load()
+					var readStarts map[string]time.Time
+					var observe func(string)
+					if collectHints {
+						readStarts = make(map[string]time.Time, len(allKeys))
+						observe = func(key string) { readStarts[key] = start }
+					}
+					newRaw, unread, readErr := readGatewaySnapshotsObserved(ctx, store.redisClient, allKeys, prevRaw, observe)
 					if readErr != nil {
 						msg := "gateway snapshot sync cannot read some keys; using their previous values where there are any"
 						if unread && prevRaw == nil {
@@ -135,6 +144,10 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 						return
 					}
 					prevRaw = newRaw
+					if collectHints {
+						observed := observations.update(newRaw, readStarts, selfGateway)
+						store.candidateRequestSnapshot.Store(buildCandidateRequestSnapshot(newRaw, observed, time.Now(), selfGateway))
+					}
 					newCache := groupSnapshotsByPod(newRaw)
 
 					// Atomically replace the snapshot cache so readers always see a consistent map.
@@ -210,9 +223,13 @@ func (c *Store) GetAllGatewayPodSnapshots(ctx context.Context, pod *Pod) ([]map[
 // appendGatewayPodSnapshotToPipeline queues HSET + EXPIRE for a single pod onto an existing pipeline.
 // The caller is responsible for calling pipe.Exec.
 func appendGatewayPodSnapshotToPipeline(ctx context.Context, pipe redis.Pipeliner, pod *Pod) {
-	key := gatewayPodSnapshotKey(gatewayPodName, pod.Namespace, pod.Name)
+	appendGatewayPodSnapshotForGateway(ctx, pipe, pod, gatewayPodName)
+}
+
+func appendGatewayPodSnapshotForGateway(ctx context.Context, pipe redis.Pipeliner, pod *Pod, selfGateway string) {
+	key := gatewayPodSnapshotKey(selfGateway, pod.Namespace, pod.Name)
 	fields := map[string]any{
-		"gateway_instance_id": gatewayPodName,
+		"gateway_instance_id": selfGateway,
 		"pod_uid":             string(pod.UID),
 		"pod_name":            pod.Name,
 		"namespace":           pod.Namespace,
@@ -269,6 +286,12 @@ func scanGatewaySnapshotKeys(ctx context.Context, client *redis.Client) ([]strin
 // unread reports that some key failed to read and has no earlier value to stand in; readErr is
 // the first failed read, for the rate-limited Error log.
 func readGatewaySnapshots(ctx context.Context, client *redis.Client, allKeys []string, prevRaw map[string]map[string]string) (raw map[string]map[string]string, unread bool, readErr error) {
+	return readGatewaySnapshotsObserved(ctx, client, allKeys, prevRaw, nil)
+}
+
+// observed records only successful, nonempty reads. Falling back to a retained
+// value must not renew its age and make an old hint appear fresh.
+func readGatewaySnapshotsObserved(ctx context.Context, client *redis.Client, allKeys []string, prevRaw map[string]map[string]string, observed func(string)) (raw map[string]map[string]string, unread bool, readErr error) {
 	raw = make(map[string]map[string]string, len(allKeys))
 	for batchStart := 0; batchStart < len(allKeys); batchStart += gatewaySnapshotHGetAllBatchSize {
 		batchEnd := batchStart + gatewaySnapshotHGetAllBatchSize
@@ -310,6 +333,9 @@ func readGatewaySnapshots(ctx context.Context, client *redis.Client, allKeys []s
 				klog.V(5).ErrorS(err, "skipping non-snapshot key under the gateway snapshot prefix", "key", chunk[i])
 			case len(fields) > 0:
 				raw[chunk[i]] = fields
+				if observed != nil {
+					observed(chunk[i])
+				}
 			}
 		}
 	}

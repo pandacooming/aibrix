@@ -379,8 +379,8 @@ type multiStrategyRouter struct {
 	scorers map[string]types.PodScorer
 }
 
-// SeedCandidates collects the seeds of every blended strategy that has them, in config order,
-// up to max pods in total. See types.CandidateSeeder.
+// SeedCandidates collects strategy seeds in config order for interface callers.
+// The K-only pipeline combines raw hints separately in candidate_budget.go.
 func (m *multiStrategyRouter) SeedCandidates(ctx *types.RoutingContext, readyPodList types.PodList, max int) []*v1.Pod {
 	if max <= 0 {
 		return nil

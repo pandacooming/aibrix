@@ -170,6 +170,10 @@ type Store struct {
 	// from Redis, grouped by pod key (namespace/name) → []fields. Swapped atomically by
 	// initGatewaySnapshotSync. Readers call Load() to get map[string][]map[string]string.
 	gatewaySnapshotCache atomic.Value
+	// candidateRequestSnapshot is an immutable approximation for candidate
+	// hints only. Its remote counts carry reader-local observation times.
+	candidateRequestSnapshot atomic.Pointer[candidateRequestSnapshot]
+	candidateHintsRequested  atomic.Bool
 	// gatewaySnapshotErrorLog rate-limits the Error-level log of failing snapshot ticks. Nil
 	// means initGatewaySnapshotSync creates one; tests set it to capture lines.
 	gatewaySnapshotErrorLog *rateLimitedErrorLog

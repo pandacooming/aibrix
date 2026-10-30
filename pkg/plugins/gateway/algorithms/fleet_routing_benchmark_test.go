@@ -92,19 +92,22 @@ func routeFleetOnce(b *testing.B, rm *RouterManager, c cache.Cache, all []*v1.Po
 	}
 }
 
-// routeFleetCandidatesOnce follows selectTargetPod with the candidate stage on: Select, then
-// SelectCandidates (K random pods plus up to M prefix holders), then the gate, the shuffle and
+// routeFleetCandidatesOnce follows selectTargetPod with the legacy candidate stage: Select,
+// then SelectCandidates (K random pods plus up to M prefix holders), the gate, the shuffle and
 // Route over the candidates only. The cost of drawing and seeding the candidates is included.
 func routeFleetCandidatesOnce(b *testing.B, rm *RouterManager, c cache.Cache, all []*v1.Pod, strategy, message string, k, m int) {
 	ctx := types.NewRoutingContext(context.Background(), types.RoutingAlgorithm(strategy), "m1", message, "req", "")
 	defer ctx.Delete()
 	ResolveRoutingOverrides(ctx)
+	ov := *ctx.RoutingOverrides()
+	ov.Candidate = types.CandidateOverrides{K: k, PrefixM: m, LegacyPrefixM: true}
+	ctx.SetRoutingOverrides(&ov)
 
 	router, err := rm.Select(ctx)
 	if err != nil {
 		b.Fatal(err)
 	}
-	pods := selectCandidates(ctx, router, all, k, m)
+	pods := SelectCandidates(ctx, router, all)
 	pods = ApplyLoadImbalanceGate(ctx, c, pods)
 	utils.Shuffle(pods)
 	if _, err := router.Route(ctx, &utils.PodArray{Pods: pods}); err != nil {
