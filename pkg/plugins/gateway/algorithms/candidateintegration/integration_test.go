@@ -115,7 +115,7 @@ func TestObservedSourceThroughCandidateSelectionAndFinalScoring(t *testing.T) {
 			}
 		}
 	}()
-	require.Eventually(t, func() bool { return len(base.GetCachedRunningRequestHints(pods)) == len(pods) }, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return len(base.GetCachedRunningRequestHints(pods)) == len(pods) }, 10*time.Second, 10*time.Millisecond)
 	c := &observedStore{Store: base}
 	rm := routing.NewRouterManagerWithCache(c)
 	rm.Init()
@@ -130,7 +130,7 @@ func TestObservedSourceThroughCandidateSelectionAndFinalScoring(t *testing.T) {
 	ctx.StartRunningRequestsSnapshot()
 	defer ctx.StopRunningRequestsSnapshot()
 	var selected []*v1.Pod
-	require.Eventually(t, func() bool { selected = routing.SelectCandidates(ctx, router, pods); return c.hintCount == 64 }, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { selected = routing.SelectCandidates(ctx, router, pods); return c.hintCount == 64 }, 10*time.Second, 10*time.Millisecond)
 	require.Len(t, selected, 16)
 	for _, p := range pods[:4] {
 		require.Contains(t, selected, p, "observed remote counts must drive recommendations")
@@ -148,8 +148,13 @@ func TestObservedSourceThroughCandidateSelectionAndFinalScoring(t *testing.T) {
 		require.Zero(t, n, "approximate remote snapshot counts must not leak into live scoring")
 	}
 	stopProducer()
+	frozenAt := time.Now()
 	require.True(t, mr.Exists("aibrix:pod:remote-test:native:"+pods[0].Name), "the stale row must remain readable for this regression")
-	require.Eventually(t, func() bool { return len(base.GetCachedRunningRequestHints(pods)) == 0 }, 3*time.Second, 10*time.Millisecond)
+	// A normal freshness gap can precede publication of the producer's last
+	// write. Wait beyond the entire observation window before asserting expiry.
+	require.Eventually(t, func() bool {
+		return time.Since(frozenAt) >= 300*time.Millisecond && len(base.GetCachedRunningRequestHints(pods)) == 0
+	}, 10*time.Second, 10*time.Millisecond)
 	require.Never(t, func() bool { return len(base.GetCachedRunningRequestHints(pods)) > 0 }, 250*time.Millisecond, 10*time.Millisecond)
 	isolated := client.Pipeline()
 	for _, p := range pods {

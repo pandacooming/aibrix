@@ -122,13 +122,18 @@ func TestSnapshotObservationDoesNotRefreshFailedRead(t *testing.T) {
 	key := gatewayPodSnapshotKey("a", "ns", "hint")
 	require.NoError(t, client.HSet(ctx, key, candidateHintFields("a", "5")).Err())
 	observed := []string{}
-	raw, unread, err := readGatewaySnapshotsObserved(ctx, client, []string{key}, nil, func(k string) { observed = append(observed, k) })
+	readBefore := time.Now()
+	raw, unread, err := readGatewaySnapshotsObserved(ctx, client, []string{key}, nil, func(k string, at time.Time) {
+		require.False(t, at.Before(readBefore))
+		require.False(t, at.After(time.Now()))
+		observed = append(observed, k)
+	})
 	require.NoError(t, err)
 	require.False(t, unread)
 	require.Equal(t, []string{key}, observed)
 	hook.failReads.Store(true)
 	observed = nil
-	retained, unread, err := readGatewaySnapshotsObserved(ctx, client, []string{key}, raw, func(k string) { observed = append(observed, k) })
+	retained, unread, err := readGatewaySnapshotsObserved(ctx, client, []string{key}, raw, func(k string, _ time.Time) { observed = append(observed, k) })
 	require.Error(t, err)
 	require.False(t, unread)
 	require.Empty(t, observed)
@@ -163,6 +168,37 @@ func TestCandidateHintRemoteOverflow(t *testing.T) {
 	raw := map[string]map[string]string{"a": candidateHintFields("a", strconv.FormatInt(1<<63-1, 10)), "b": candidateHintFields("b", "1")}
 	store.candidateRequestSnapshot.Store(buildCandidateRequestSnapshot(raw, map[string]time.Time{"a": now, "b": now}, now, gatewayPodName))
 	require.Empty(t, store.cachedRunningRequestHintsAt([]*v1.Pod{pod.Pod}, now))
+}
+
+func TestCandidateHintsRejectMixedGatewayPodIdentities(t *testing.T) {
+	store, pod, _ := candidateHintStore(t)
+	now := time.Unix(1000, 0)
+	for _, missingGateway := range []bool{false, true} {
+		name := "recreated-pod"
+		if missingGateway {
+			name = "missing-gateway"
+		}
+		t.Run(name, func(t *testing.T) {
+			a, b := candidateHintFields("a", "5"), candidateHintFields("b", "7")
+			if missingGateway {
+				b["gateway_instance_id"] = ""
+			} else {
+				b["pod_uid"] = "replacement"
+			}
+			snapshot := buildCandidateRequestSnapshot(map[string]map[string]string{"a": a, "b": b}, map[string]time.Time{"a": now, "b": now}, now, gatewayPodName)
+			require.False(t, snapshot.pods["ns/hint"].valid, "mixed identity cannot establish a scoped count")
+			store.candidateRequestSnapshot.Store(snapshot)
+			require.Empty(t, store.cachedRunningRequestHintsAt([]*v1.Pod{pod.Pod}, now))
+		})
+	}
+	// The remote observation already describes the replacement, but the local
+	// counter still belongs to the old Pod with the same namespace/name.
+	replacement := pod.DeepCopy()
+	replacement.UID = "replacement"
+	fields := candidateHintFields("a", "5")
+	fields["pod_uid"] = string(replacement.UID)
+	store.candidateRequestSnapshot.Store(buildCandidateRequestSnapshot(map[string]map[string]string{"a": fields}, map[string]time.Time{"a": now}, now, gatewayPodName))
+	require.Empty(t, store.cachedRunningRequestHintsAt([]*v1.Pod{replacement}, now), "old local counts must not be combined with a new remote identity")
 }
 
 func BenchmarkCandidateHintSources(b *testing.B) {

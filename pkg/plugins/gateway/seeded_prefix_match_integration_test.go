@@ -86,6 +86,8 @@ func prefixMatchOperations(t *testing.T, model string) map[string]float64 {
 // Use the real gateway, candidate selector, composite router, prefix index and
 // PostRouteUpdate. An all-miss first decision also proves that successful
 // admission still credits the selected pod while retaining the zero matches.
+//
+//nolint:staticcheck // Explicit M intentionally exercises the legacy candidate path.
 func TestSelectTargetPodReusesPrefixMatchesThroughRealPipeline(t *testing.T) {
 	for _, kvSync := range []bool{false, true} {
 		for _, tc := range []struct {

@@ -34,7 +34,7 @@ type CachedRunningRequestHintProvider interface {
 	GetCachedRunningRequestHints(pods []*v1.Pod) map[string]int64
 }
 
-// Two background ticks is the current experimental recommendation window,
+// Two background ticks bound the candidate recommendation window,
 // tighter than Redis's retention TTL. It is not a user configuration option.
 const candidateHintMaxObservationAge = 2 * gatewaySnapshotSyncInterval
 
@@ -156,7 +156,9 @@ func (c *Store) cachedRunningRequestHintsAt(pods []*v1.Pod, now time.Time) map[s
 		c.candidateHintsRequested.Store(true)
 	}
 	snapshot := c.candidateRequestSnapshot.Load()
-	if snapshot == nil || now.Before(snapshot.at) || now.Sub(snapshot.at) >= candidateHintMaxObservationAge {
+	// Per-pod observation ages already conservatively bound snapshot age;
+	// republishing old rows must not renew those observations.
+	if snapshot == nil {
 		return out
 	}
 	for _, pod := range pods {

@@ -122,10 +122,10 @@ func initGatewaySnapshotSync(store *Store, stopCh <-chan struct{}) {
 					// for exactly the keys that could not be read (see readGatewaySnapshots).
 					collectHints := store.candidateHintsRequested.Load()
 					var readStarts map[string]time.Time
-					var observe func(string)
+					var observe func(string, time.Time)
 					if collectHints {
 						readStarts = make(map[string]time.Time, len(allKeys))
-						observe = func(key string) { readStarts[key] = start }
+						observe = func(key string, at time.Time) { readStarts[key] = at }
 					}
 					newRaw, unread, readErr := readGatewaySnapshotsObserved(ctx, store.redisClient, allKeys, prevRaw, observe)
 					if readErr != nil {
@@ -291,7 +291,7 @@ func readGatewaySnapshots(ctx context.Context, client *redis.Client, allKeys []s
 
 // observed records only successful, nonempty reads. Falling back to a retained
 // value must not renew its age and make an old hint appear fresh.
-func readGatewaySnapshotsObserved(ctx context.Context, client *redis.Client, allKeys []string, prevRaw map[string]map[string]string, observed func(string)) (raw map[string]map[string]string, unread bool, readErr error) {
+func readGatewaySnapshotsObserved(ctx context.Context, client *redis.Client, allKeys []string, prevRaw map[string]map[string]string, observed func(string, time.Time)) (raw map[string]map[string]string, unread bool, readErr error) {
 	raw = make(map[string]map[string]string, len(allKeys))
 	for batchStart := 0; batchStart < len(allKeys); batchStart += gatewaySnapshotHGetAllBatchSize {
 		batchEnd := batchStart + gatewaySnapshotHGetAllBatchSize
@@ -303,6 +303,12 @@ func readGatewaySnapshotsObserved(ctx context.Context, client *redis.Client, all
 		cmds := make([]*redis.MapStringStringCmd, len(chunk))
 		for i, key := range chunk {
 			cmds[i] = readPipe.HGetAll(ctx, key)
+		}
+		// Bound source age from this read, excluding write/SCAN phases and
+		// earlier batches. Queued pipeline commands have not run yet.
+		var readStart time.Time
+		if observed != nil {
+			readStart = time.Now()
 		}
 		_, execErr := readPipe.Exec(ctx)
 		batchFailed := execErr != nil && !isRedisReply(execErr)
@@ -334,7 +340,7 @@ func readGatewaySnapshotsObserved(ctx context.Context, client *redis.Client, all
 			case len(fields) > 0:
 				raw[chunk[i]] = fields
 				if observed != nil {
-					observed(chunk[i])
+					observed(chunk[i], readStart)
 				}
 			}
 		}
