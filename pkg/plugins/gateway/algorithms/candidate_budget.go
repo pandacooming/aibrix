@@ -213,7 +213,11 @@ func fallbackBudgetCandidates(ctx *types.RoutingContext, src candidateSources, r
 	if src.prefixWeight == 0 {
 		return selectCandidates(ctx, nil, ready, k, 0)
 	}
-	return selectCandidatesWithSeeder(ctx, prefixOnlyCandidateSeeder{seeder: src.seeder}, ready, (k+1)/2, k/2)
+	seeder := prefixOnlyCandidateSeeder{seeder: src.seeder}
+	seeds := seeder.SeedCandidates(ctx, &utils.PodArray{Pods: ready}, k/2)
+	// Unused prefix slots belong to the random pool. In particular, K=2 and a
+	// cache miss must still leave two pods for the final scorer to compare.
+	return fillCandidatePods(ready, seeds, k)
 }
 
 func candidateCapacities(c cache.Cache, pods []*v1.Pod) []float64 {
@@ -374,9 +378,11 @@ func candidateRecommendationBudget(k int) int {
 }
 
 func budgetCandidateSeeds(k int, recommendations []*v1.Pod, view *candidatePrefixView) []*v1.Pod {
-	// Once the cost recommendation cap saturates, preserve prefix coverage as
-	// K grows rather than giving every extra slot to uniform random sampling.
-	prefixBudget := max(0, k/2-candidatePrefixSlotsPerRecommendation*len(recommendations))
+	// Reserve room for prefix holders even when the load recommendations fill
+	// their cap. Keep the existing larger reserve as K grows, while leaving at
+	// least half the budget for random exploration.
+	r := len(recommendations)
+	prefixBudget := max(min(k/2, r), k/2-candidatePrefixSlotsPerRecommendation*r)
 	seeds := append([]*v1.Pod(nil), recommendations...)
 	if view != nil && prefixBudget > 0 {
 		for _, p := range view.seeds(prefixBudget + len(recommendations)) {

@@ -189,11 +189,12 @@ The four `AIBRIX_ROUTING_AUTO_BLEND_*` weights can also be set per request by th
 Off by default (`K=0`). With only `AIBRIX_ROUTING_CANDIDATE_K` or
 `routingConfig.candidate.k` configured, K is the **total** candidate budget.
 Up to min(floor(K/4), 4) candidates are recommended from a bounded scout pool
-using observed counts, capacity and KV pressure. Larger K also retains a
-prefix reserve; other slots are sampled uniformly without replacement. Missing
-or stale count observations use the reference random/prefix policy for strategies
-that need counts; pure KV selection uses its cached KV metrics. Fallback can return
-fewer than K candidates. K<4 uses the reference. See the
+using observed counts, capacity and KV pressure. When prefix matches exist, a
+prefix reserve keeps holders in the pool; other slots are sampled uniformly
+without replacement. Missing or stale count observations use random and prefix
+selection for strategies that need counts; pure KV selection uses its cached KV
+metrics. If fewer prefix holders are available, random sampling fills the unused
+slots. K<4 uses the same fallback. See the
 [candidate selection design](algorithms/candidate_selection.md).
 
 Count-dependent load-balance, least-request and prefix-cache blends use at most

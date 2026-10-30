@@ -17,10 +17,10 @@ The complete resolved strategy, including auto-blending, must be candidate-safe.
    ```
 
    Finite positive cached output rates estimate capacity; missing estimates use their mean. With no other strategy, prefix weight is its own denominator. This preselection heuristic is not equivalent to final normalized strategy scores. Pure least-request uses count alone.
-5. Preserve up to `max(0, floor(K/2) - 4R)` additional longest-prefix holders, where R is the actual recommendation count. Exclude recommendations from this reserve and fill remaining slots uniformly without replacement. This path returns K distinct ready pods when N>K.
+5. Preserve up to `max(min(floor(K/2), R), floor(K/2) - 4R)` additional longest-prefix holders, where R is the actual recommendation count. This reserves prefix coverage even at K=16 while retaining at least half of K for random exploration. Exclude recommendations from this reserve and fill remaining slots uniformly without replacement. This path returns K distinct ready pods when N>K.
 6. The existing gate, live final strategy scoring, normalization, port selection and admission operate on the selected pool.
 
-If the requested count objective has no usable observations, use reference selection directly: random K without prefix, or `ceil(K/2)` random plus up to `floor(K/2)` prefix holders. K is an upper bound in this fallback; insufficient holders can leave fewer than K candidates. K<4 also uses the reference. Unknown counts are never assumed idle.
+If the requested count objective has no usable observations, use random K without prefix, or up to `floor(K/2)` prefix holders plus random pods for the remaining slots. Fewer prefix holders leave more room for random sampling, so the fallback also returns K distinct ready pods when N>K. K<4 uses the same fallback. Unknown counts are never assumed idle.
 
 The user configures only K: no new allocation, scout-size or freshness setting. Prefix lookup and the existing full-fleet inflight prefilter can still scale with N.
 
@@ -46,7 +46,7 @@ Existing K-only configurations previously added implicit M=16. K now means the t
 
 ## Verification and reproduction
 
-Deterministic tests cover each cost term, strategy objectives, KV blends, recommendation caps, exact K=8/16/32/64 composition, insufficient prefix holders, outside-scout prefix holders, fallback paths and metric reasons. Cache tests cover freshness, unchanged/failing reads, mixed remote Pod identities, missing gateway identities and stale local Pod identity. A separate-process integration fixture runs the actual source, selector, gate and final scoring; expiry assertions start only after the full observation window following producer shutdown.
+Deterministic tests cover each cost term, strategy objectives, KV blends, recommendation caps, exact K=8/16/32/64 composition, insufficient prefix holders, outside-scout prefix holders, fallback paths and metric reasons. A real local prefix index regression checks that a lone holder participates in blended scoring without bypassing the overload gate. Cache tests cover freshness, unchanged/failing reads, mixed remote Pod identities, missing gateway identities and stale local Pod identity. A separate-process integration fixture runs the actual source, selector, gate and final scoring; expiry assertions start only after the full observation window following producer shutdown.
 
 Static objective-quality probe (fixed fleet seeds, stochastic production sampling; this is not latency):
 
@@ -70,6 +70,14 @@ Selection-only CPU benchmark, run serially:
 
 ```sh
 go test ./pkg/plugins/gateway/algorithms -run '^$' -bench '^BenchmarkNativeCandidateBudget$' -benchmem -benchtime=250ms -count=5
+```
+
+For the prefix reserve, `BenchmarkBudgetPrefixSelection` measures the selector
+with precomputed prefix scores and count hints over 500 and 2,000 pods with 1,
+16 or 256 holders. It excludes prefix-index lookup, the gate and final scoring:
+
+```sh
+go test ./pkg/plugins/gateway/algorithms -run '^$' -bench '^BenchmarkBudgetPrefixSelection$' -benchmem -benchtime=250ms -count=5
 ```
 
 Results belong in the PR description. This document makes no inference/GPU latency or production-wide non-regression claim.

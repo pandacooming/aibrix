@@ -139,7 +139,7 @@ func TestBudgetPureKVUsesMetricsWithoutCountHints(t *testing.T) {
 func TestBudgetExactSeedComposition(t *testing.T) {
 	pods := candidatePods(80)
 	for _, tc := range []struct{ k, r, holders, extra int }{
-		{8, 2, 32, 0}, {16, 4, 32, 0}, {32, 4, 32, 0}, {64, 4, 32, 16},
+		{8, 2, 32, 2}, {16, 4, 32, 4}, {32, 4, 32, 4}, {64, 4, 32, 16},
 		{64, 2, 32, 24}, {64, 4, 7, 3}, {64, 4, 0, 0},
 	} {
 		t.Run(fmt.Sprintf("K=%d/R=%d/holders=%d", tc.k, tc.r, tc.holders), func(t *testing.T) {
@@ -264,6 +264,7 @@ func TestBudgetNoValidRecommendationUsesReferenceFallback(t *testing.T) {
 	counter := candidateSelectionPaths.WithLabelValues("no_valid_recommendation")
 	before := testutil.ToFloat64(counter)
 	got := SelectCandidates(ctx, router, pods)
-	require.Len(t, got, 9, "reference fallback keeps eight random slots and the single available prefix seed")
+	require.Len(t, got, 16, "unused prefix slots must be returned to random sampling")
+	require.Contains(t, got, pods[0], "the available prefix holder must be retained")
 	require.Equal(t, before+1, testutil.ToFloat64(counter))
 }
