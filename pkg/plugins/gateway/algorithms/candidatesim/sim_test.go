@@ -932,12 +932,6 @@ func TestCandidateSelectionKOnly(t *testing.T) {
 		live(policy{Kind: policyRandomSeeded, K: 16}),
 		live(policy{Kind: policyBlendRanked, K: 16}),
 		live(policy{Kind: policyScoutRecommend, K: 16}),
-		live(policy{Kind: policyRandomSeeded, K: 32}),
-		live(policy{Kind: policyBlendRanked, K: 32}),
-		live(policy{Kind: policyScoutRecommend, K: 32}),
-		// Ranking three quarters of the slots: the sample stops resembling the fleet, the gate
-		// on the sample fires against hot prefix holders, and prefix-on runs can destabilize.
-		live(policy{Kind: policyBlendRanked, K: 32, Ranked: 24}),
 	}
 	seeds := []uint64{1, 2, 3}
 	type scenario struct {
@@ -946,7 +940,7 @@ func TestCandidateSelectionKOnly(t *testing.T) {
 	}
 	var scenarios []scenario
 	for _, prefixOn := range []bool{false, true} {
-		for _, delay := range []time.Duration{100 * time.Millisecond, time.Second} {
+		for _, delay := range []time.Duration{100 * time.Millisecond, time.Second, 1000000 * time.Second} {
 			scenarios = append(scenarios, scenario{prefixOn, delay})
 		}
 	}
@@ -959,7 +953,7 @@ func TestCandidateSelectionKOnly(t *testing.T) {
 			results[si][ki] = make([]result, len(policies))
 			for pi, pol := range policies {
 				cfg := simConfig{
-					Pods: pods, Gateways: 4, Utilization: 0.85, MeanWork: 200,
+					Pods: pods, Gateways: simGateways(), Utilization: 0.85, MeanWork: 200,
 					PrefixOn: sc.prefixOn, PrefixGroups: 2000, PrefixPerPod: 32, PrefixSaving: 0.3,
 					SignalDelay: sc.delay, Step: 5 * time.Millisecond,
 					Warmup: 3 * time.Second, Duration: 15 * time.Second,
@@ -979,7 +973,7 @@ func TestCandidateSelectionKOnly(t *testing.T) {
 	wg.Wait()
 
 	var out strings.Builder
-	fmt.Fprintf(&out, "\n### N=%d, 4 gateways, utilization 0.85, %d seeds\n\n", pods, len(seeds))
+	fmt.Fprintf(&out, "\n### N=%d, %d gateways, utilization 0.85, %d seeds\n\n", pods, simGateways(), len(seeds))
 	out.WriteString("Mean latency relative to full scoring on the same seed: mean (min to max); P99 ratio after the semicolon; prefix hit after the slash. Full scoring's mean latency in seconds in the first row.\n\n")
 	out.WriteString("| Policy |")
 	for _, sc := range scenarios {
@@ -1145,4 +1139,93 @@ func liveM() int {
 		return n
 	}
 	return 16
+}
+
+// simGateways is CANDIDATE_SIM_GATEWAYS, 4 by default (local experiment only).
+func simGateways() int {
+	if v, err := strconv.Atoi(os.Getenv("CANDIDATE_SIM_GATEWAYS")); err == nil && v > 0 {
+		return v
+	}
+	return 4
+}
+
+// TestCandidateRefreshInterval measures how fresh the other gateways' running counts must be
+// for the K-only candidate stage (#3442): it runs that policy with the remote counts refreshed
+// every 100 ms, 500 ms, 1 s and 2 s, and never (local counts only), and reports absolute mean
+// latency, P99 latency and prefix hit ratio, mean over seeds with the min-max range. Run it
+// with CANDIDATE_SIM=refresh; CANDIDATE_SIM_PODS and CANDIDATE_SIM_GATEWAYS set the fleet.
+func TestCandidateRefreshInterval(t *testing.T) {
+	if os.Getenv("CANDIDATE_SIM") != "refresh" {
+		t.Skip("set CANDIDATE_SIM=refresh to run the refresh-interval comparison")
+	}
+	pods := 500
+	if v, err := strconv.Atoi(os.Getenv("CANDIDATE_SIM_PODS")); err == nil && v > 0 {
+		pods = v
+	}
+	pol := policy{Kind: policyBlendRanked, K: 16, LiveScoring: true, GateSample: true}
+	never := 1000000 * time.Second
+	delays := []time.Duration{100 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, never}
+	seeds := []uint64{1, 2, 3}
+	prefixes := []bool{false, true}
+
+	results := make([][][]result, len(prefixes))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for pi, prefixOn := range prefixes {
+		results[pi] = make([][]result, len(delays))
+		for di, delay := range delays {
+			results[pi][di] = make([]result, len(seeds))
+			for si, seed := range seeds {
+				cfg := simConfig{
+					Pods: pods, Gateways: simGateways(), Utilization: 0.85, MeanWork: 200,
+					PrefixOn: prefixOn, PrefixGroups: 2000, PrefixPerPod: 32, PrefixSaving: 0.3,
+					SignalDelay: delay, Step: 5 * time.Millisecond,
+					Warmup: 3 * time.Second, Duration: 15 * time.Second,
+					PrefixSeedMax: 16, SeedRandom: true, Seed: seed,
+					ImbalanceMinGap: 8, ImbalanceFactor: 2,
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					results[pi][di][si] = newSim(cfg, pol).run()
+				}()
+			}
+		}
+	}
+	wg.Wait()
+
+	stat := func(rs []result, f func(result) float64) (mean, lo, hi float64) {
+		lo, hi = math.Inf(1), math.Inf(-1)
+		for _, r := range rs {
+			x := f(r)
+			mean += x
+			lo, hi = math.Min(lo, x), math.Max(hi, x)
+		}
+		return mean / float64(len(rs)), lo, hi
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "\n### %s; N=%d, %d gateways, utilization 0.85, %d seeds\n\n", pol, pods, simGateways(), len(seeds))
+	for pi, prefixOn := range prefixes {
+		fmt.Fprintf(&out, "prefix=%v\n\n| Remote refresh | Mean latency (ms) | P99 latency (ms) | Prefix hit |\n| --- | --- | --- | --- |\n", prefixOn)
+		for di, delay := range delays {
+			name := delay.String()
+			if delay == never {
+				name = "never"
+			}
+			m, mlo, mhi := stat(results[pi][di], func(r result) float64 { return 1000 * r.MeanLatency })
+			p, plo, phi := stat(results[pi][di], func(r result) float64 { return 1000 * r.P99Latency })
+			h, hlo, hhi := stat(results[pi][di], func(r result) float64 { return 100 * r.PrefixHit })
+			fmt.Fprintf(&out, "| %s | %.1f (%.1f to %.1f) | %.1f (%.1f to %.1f) | %.1f%% (%.1f to %.1f) |\n",
+				name, m, mlo, mhi, p, plo, phi, h, hlo, hhi)
+		}
+		out.WriteString("\n")
+	}
+	t.Log(out.String())
+	if path := os.Getenv("CANDIDATE_SIM_OUT"); path != "" {
+		if err := os.WriteFile(path, []byte(out.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
