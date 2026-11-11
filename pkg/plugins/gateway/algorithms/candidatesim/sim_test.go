@@ -1165,6 +1165,21 @@ func TestCandidateRefreshInterval(t *testing.T) {
 	pol := policy{Kind: policyBlendRanked, K: 16, LiveScoring: true, GateSample: true}
 	never := 1000000 * time.Second
 	delays := []time.Duration{100 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, never}
+	if v := os.Getenv("CANDIDATE_SIM_DELAYS"); v != "" {
+		// A comma-separated list of refresh intervals, e.g. "3s,4s"; "never" means local counts only.
+		delays = nil
+		for _, f := range strings.Split(v, ",") {
+			if f == "never" {
+				delays = append(delays, never)
+				continue
+			}
+			d, err := time.ParseDuration(f)
+			if err != nil {
+				t.Fatalf("CANDIDATE_SIM_DELAYS: %v", err)
+			}
+			delays = append(delays, d)
+		}
+	}
 	seeds := []uint64{1, 2, 3}
 	prefixes := []bool{false, true}
 
