@@ -44,6 +44,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,6 +77,13 @@ type simConfig struct {
 	ImbalanceMinGap int
 	ImbalanceFactor float64
 	Seed            uint64
+	// RefreshOnRead lets stage 2's exact read of the candidates also refresh the gateway's
+	// snapshot of those pods (refTotal, refLocal and read time), as if the per-gateway fields
+	// read from Redis were written back into the in-memory estimate.
+	RefreshOnRead bool
+	// MaxRemoteAge, when positive, drops a pod's remote share (refTotal-refLocal) from the
+	// estimate once the gateway last read that pod longer ago than this: local count only.
+	MaxRemoteAge time.Duration
 }
 
 type policyKind int
@@ -195,6 +203,12 @@ type result struct {
 	PrefixHit     float64
 	ScoredPerReq  float64
 	MaxToMeanLoad float64 // time-averaged max/mean running across pods
+	// Ranked half (policyBlendRanked only): mean true running, and running/capacity, of the
+	// ranked pods relative to the fleet mean at the same decisions; share of ranked slots that
+	// the gateway's previous decision also ranked; and share that were ranked then and have
+	// more running now than at that previous decision.
+	RankedRunRatio, RankedLoadRatio float64
+	Rerank, RerankRisen             float64
 }
 
 type sim struct {
@@ -211,6 +225,7 @@ type sim struct {
 	local       [][]int
 	refTotal    [][]int
 	refLocal    [][]int
+	lastRead    [][]float64 // per gateway, per pod: time of the last sweep or read-refresh
 	nextRefresh float64
 
 	// Per gateway ranking snapshot for policySnapshot.
@@ -225,6 +240,15 @@ type sim struct {
 	scored         int
 	loadRatioSum   float64
 	loadRatioN     int
+
+	// Ranked-half quality of policyBlendRanked, after the warmup. ranked holds the pods the
+	// current decision filled by rank; prevRanked, per gateway, the pods ranked in its previous
+	// decision with their true running count at that decision.
+	ranked                      []int
+	prevRanked                  []map[int]int
+	rankedRunSum, fleetRunSum   float64
+	rankedLoadSum, fleetLoadSum float64
+	rankedSlots, rerank, risen  int
 }
 
 func newSim(cfg simConfig, pol policy) *sim {
@@ -239,6 +263,12 @@ func newSim(cfg simConfig, pol policy) *sim {
 		s.local = append(s.local, make([]int, cfg.Pods))
 		s.refTotal = append(s.refTotal, make([]int, cfg.Pods))
 		s.refLocal = append(s.refLocal, make([]int, cfg.Pods))
+		never := make([]float64, cfg.Pods)
+		for i := range never {
+			never[i] = math.Inf(-1)
+		}
+		s.lastRead = append(s.lastRead, never)
+		s.prevRanked = append(s.prevRanked, nil)
 		s.snapshot = append(s.snapshot, nil)
 	}
 	return s
@@ -248,6 +278,9 @@ func newSim(cfg simConfig, pol policy) *sim {
 func (s *sim) observed(g, i int) int {
 	if s.cfg.SignalDelay == 0 || s.exact {
 		return len(s.pods[i].running)
+	}
+	if s.cfg.MaxRemoteAge > 0 && s.now-s.lastRead[g][i] > s.cfg.MaxRemoteAge.Seconds() {
+		return s.local[g][i]
 	}
 	return s.refTotal[g][i] - s.refLocal[g][i] + s.local[g][i]
 }
@@ -261,6 +294,7 @@ func (s *sim) refreshSignals() {
 		for i, p := range s.pods {
 			s.refTotal[g][i] = len(p.running)
 			s.refLocal[g][i] = s.local[g][i]
+			s.lastRead[g][i] = s.now
 		}
 	}
 }
@@ -468,6 +502,7 @@ func (s *sim) candidates(g, group int, universe []int, allowed map[int]bool) []i
 			r = min(s.pol.Ranked, k)
 		}
 		ranked := s.bestByEstimate(g, group, scout, r)
+		s.ranked = append(s.ranked[:0], ranked...)
 		return s.fillRandom(universe, ranked, k)
 	case policyScoutRecommend:
 		if n <= k {
@@ -589,7 +624,17 @@ func (s *sim) routeGateSample(r *request, group int) {
 	for i := range fleet {
 		fleet[i] = i
 	}
+	s.ranked = s.ranked[:0]
 	cand := s.candidates(g, group, fleet, nil)
+	s.trackRanked(g)
+	if s.cfg.RefreshOnRead {
+		// Stage 2 reads the candidates' exact counts; keep them as this gateway's snapshot.
+		for _, i := range cand {
+			s.refTotal[g][i] = len(s.pods[i].running)
+			s.refLocal[g][i] = s.local[g][i]
+			s.lastRead[g][i] = s.now
+		}
+	}
 	s.exact = s.pol.LiveScoring
 	defer func() { s.exact = false }()
 	if gated := s.eligibleAmong(g, cand); gated != nil {
@@ -604,6 +649,44 @@ func (s *sim) routeGateSample(r *request, group int) {
 	s.decided++
 	s.scored += len(cand)
 	s.place(r, target, group)
+}
+
+// trackRanked records, for the pods the current decision ranked, their true load against the
+// fleet's and whether gateway g also ranked them in its previous decision while their true
+// running count has since risen. It does not draw from the random source.
+func (s *sim) trackRanked(g int) {
+	if len(s.ranked) == 0 {
+		return
+	}
+	cur := make(map[int]int, len(s.ranked))
+	for _, i := range s.ranked {
+		cur[i] = len(s.pods[i].running)
+	}
+	if s.now >= s.cfg.Warmup.Seconds() {
+		fleetRun, fleetLoad := 0, 0.0
+		for _, p := range s.pods {
+			fleetRun += len(p.running)
+			fleetLoad += float64(len(p.running)) / p.capacity
+		}
+		run, load := 0.0, 0.0
+		for _, i := range s.ranked {
+			run += float64(cur[i])
+			load += float64(cur[i]) / s.pods[i].capacity
+			if before, ok := s.prevRanked[g][i]; ok {
+				s.rerank++
+				if cur[i] > before {
+					s.risen++
+				}
+			}
+		}
+		n, m := float64(len(s.ranked)), float64(len(s.pods))
+		s.rankedRunSum += run / n
+		s.fleetRunSum += float64(fleetRun) / m
+		s.rankedLoadSum += load / n
+		s.fleetLoadSum += fleetLoad / m
+		s.rankedSlots += len(s.ranked)
+	}
+	s.prevRanked[g] = cur
 }
 
 func (s *sim) place(r *request, target, group int) {
@@ -735,6 +818,12 @@ func (s *sim) run() result {
 	}
 	if cfg.PrefixOn {
 		res.PrefixHit = float64(s.hits) / float64(s.decided)
+	}
+	if s.rankedSlots > 0 {
+		res.RankedRunRatio = s.rankedRunSum / s.fleetRunSum
+		res.RankedLoadRatio = s.rankedLoadSum / s.fleetLoadSum
+		res.Rerank = float64(s.rerank) / float64(s.rankedSlots)
+		res.RerankRisen = float64(s.risen) / float64(s.rankedSlots)
 	}
 	return res
 }
@@ -1236,6 +1325,195 @@ func TestCandidateRefreshInterval(t *testing.T) {
 				name, m, mlo, mhi, p, plo, phi, h, hlo, hhi)
 		}
 		out.WriteString("\n")
+	}
+	t.Log(out.String())
+	if path := os.Getenv("CANDIDATE_SIM_OUT"); path != "" {
+		if err := os.WriteFile(path, []byte(out.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestCandidateRefreshPolicies compares three ways of keeping the other gateways' running
+// counts fresh for the K-only candidate stage (#3442): a background sweep every second
+// (sweep-only), stage 2's exact read of the K candidates written back into the estimate
+// (refresh-on-read, no sweep), and both (hybrid). All three drop a pod's remote share once the
+// gateway last read it more than 3 s ago. The per-gateway request rate is set by MeanWork at
+// utilization 0.85, and the simulated time scales with the service time. Run it with
+// CANDIDATE_SIM=policies; CANDIDATE_SIM_KS, CANDIDATE_SIM_RATES (req/s per gateway),
+// CANDIDATE_SIM_PREFIX (off, on or both), CANDIDATE_SIM_PODS and CANDIDATE_SIM_GATEWAYS
+// narrow the grid, and CANDIDATE_SIM_VALIDATE=1 instead reruns the 1 s row of
+// TestCandidateRefreshInterval through the sweep-only path.
+func TestCandidateRefreshPolicies(t *testing.T) {
+	if os.Getenv("CANDIDATE_SIM") != "policies" {
+		t.Skip("set CANDIDATE_SIM=policies to run the refresh-policy comparison")
+	}
+	ints := func(env string, def []int) []int {
+		v := os.Getenv(env)
+		if v == "" {
+			return def
+		}
+		var out []int
+		for _, f := range strings.Split(v, ",") {
+			n, err := strconv.Atoi(f)
+			if err != nil {
+				t.Fatalf("%s: %v", env, err)
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+	never := 1000000 * time.Second
+	type refresh struct {
+		name          string
+		sweep         time.Duration
+		refreshOnRead bool
+	}
+	refreshes := []refresh{
+		{"sweep-only", time.Second, false},
+		{"refresh-on-read", never, true},
+		{"hybrid", time.Second, true},
+	}
+	pods, gateways := 2000, 8
+	if v, err := strconv.Atoi(os.Getenv("CANDIDATE_SIM_PODS")); err == nil && v > 0 {
+		pods = v
+	}
+	if v, err := strconv.Atoi(os.Getenv("CANDIDATE_SIM_GATEWAYS")); err == nil && v > 0 {
+		gateways = v
+	}
+	ks := ints("CANDIDATE_SIM_KS", []int{16, 32, 100})
+	rates := ints("CANDIDATE_SIM_RATES", []int{10, 100, 1000})
+	prefixes := []bool{false}
+	switch os.Getenv("CANDIDATE_SIM_PREFIX") {
+	case "on":
+		prefixes = []bool{true}
+	case "both":
+		prefixes = []bool{false, true}
+	}
+	seeds := []uint64{1, 2, 3}
+	validate := os.Getenv("CANDIDATE_SIM_VALIDATE") != ""
+	if validate {
+		pods, gateways, ks, rates, prefixes = 500, 4, []int{16}, []int{0}, []bool{false, true}
+		refreshes = []refresh{{"sweep-only", time.Second, false}}
+	}
+	fleetCap := 0.0
+	caps := []float64{3000, 4000, 6000} // as newSim assigns them
+	for i := 0; i < pods; i++ {
+		fleetCap += caps[i%len(caps)]
+	}
+	const utilization = 0.85
+	// meanWork returns the MeanWork that makes run() arrive at rate req/s per gateway.
+	meanWork := func(rate int, prefixOn bool) float64 {
+		w := utilization * fleetCap / float64(rate*gateways)
+		if prefixOn {
+			w /= 1 - 0.3*0.5 // run() assumes half the requests save 30%
+		}
+		return w
+	}
+	config := func(rate int, prefixOn bool, rf refresh, seed uint64) simConfig {
+		cfg := simConfig{
+			Pods: pods, Gateways: gateways, Utilization: utilization,
+			PrefixOn: prefixOn, PrefixGroups: 2000, PrefixPerPod: 32, PrefixSaving: 0.3,
+			SignalDelay: rf.sweep, Step: 5 * time.Millisecond,
+			PrefixSeedMax: 16, SeedRandom: true, Seed: seed,
+			ImbalanceMinGap: 8, ImbalanceFactor: 2,
+			RefreshOnRead: rf.refreshOnRead, MaxRemoteAge: 3 * time.Second,
+		}
+		if validate {
+			cfg.MeanWork, cfg.Warmup, cfg.Duration = 200, 3*time.Second, 15*time.Second
+			return cfg
+		}
+		// About 10 service times of warmup and 40 measured, 64,000 measured requests at G=8.
+		cfg.MeanWork = meanWork(rate, prefixOn)
+		cfg.Warmup = time.Duration(2000/float64(rate)*1e9) * time.Nanosecond
+		cfg.Duration = time.Duration(10000/float64(rate)*1e9) * time.Nanosecond
+		return cfg
+	}
+
+	type key struct{ pi, ki, ri, fi, si int }
+	results := map[key]result{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+	start := time.Now()
+	for pi, prefixOn := range prefixes {
+		for ki, k := range ks {
+			for ri, rate := range rates {
+				for fi, rf := range refreshes {
+					for si, seed := range seeds {
+						cfg := config(rate, prefixOn, rf, seed)
+						pol := policy{Kind: policyBlendRanked, K: k, LiveScoring: true, GateSample: true}
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							sem <- struct{}{}
+							defer func() { <-sem }()
+							t0 := time.Now()
+							r := newSim(cfg, pol).run()
+							mu.Lock()
+							results[key{pi, ki, ri, fi, si}] = r
+							mu.Unlock()
+							t.Logf("done prefix=%v K=%d rate=%d %s seed=%d in %v", prefixOn, k, rate, refreshes[fi].name, seed, time.Since(t0).Round(time.Second))
+						}()
+					}
+				}
+			}
+		}
+	}
+	wg.Wait()
+
+	var out strings.Builder
+	fmt.Fprintf(&out, "\nN=%d, %d gateways, utilization %.2f, %d seeds, remote age limit 3s, wall %v, %d CPUs\n",
+		pods, gateways, utilization, len(seeds), time.Since(start).Round(time.Second), runtime.NumCPU())
+	if !validate {
+		for _, rate := range rates {
+			w := meanWork(rate, false)
+			fmt.Fprintf(&out, "rate %d/gateway: MeanWork %.0f (prefix on %.0f), mean work / mean pod capacity %.3f s\n",
+				rate, w, meanWork(rate, true), w/(fleetCap/float64(pods)))
+		}
+	}
+	cell := func(rs []result, f func(result) float64, format string) string {
+		mean, lo, hi := 0.0, math.Inf(1), math.Inf(-1)
+		for _, r := range rs {
+			x := f(r)
+			mean += x
+			lo, hi = math.Min(lo, x), math.Max(hi, x)
+		}
+		return fmt.Sprintf(format+" ("+format+"–"+format+")", mean/float64(len(rs)), lo, hi)
+	}
+	for pi, prefixOn := range prefixes {
+		for ki, k := range ks {
+			fmt.Fprintf(&out, "\n### K=%d, prefix=%v\n\n", k, prefixOn)
+			out.WriteString("| Rate/gw | Policy | Mean (ms) | P99 (ms) | Gate fired | Ranked run / fleet | Ranked load / fleet | Re-ranked | Re-ranked, risen |")
+			if prefixOn {
+				out.WriteString(" Prefix hit |")
+			}
+			out.WriteString("\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+			if prefixOn {
+				out.WriteString(" --- |")
+			}
+			out.WriteString("\n")
+			for ri, rate := range rates {
+				for fi, rf := range refreshes {
+					rs := make([]result, len(seeds))
+					for si := range seeds {
+						rs[si] = results[key{pi, ki, ri, fi, si}]
+					}
+					fmt.Fprintf(&out, "| %d | %s | %s | %s | %s | %s | %s | %s | %s |", rate, rf.name,
+						cell(rs, func(r result) float64 { return 1000 * r.MeanLatency }, "%.1f"),
+						cell(rs, func(r result) float64 { return 1000 * r.P99Latency }, "%.0f"),
+						cell(rs, func(r result) float64 { return 100 * r.Gated }, "%.1f%%"),
+						cell(rs, func(r result) float64 { return r.RankedRunRatio }, "%.3f"),
+						cell(rs, func(r result) float64 { return r.RankedLoadRatio }, "%.3f"),
+						cell(rs, func(r result) float64 { return 100 * r.Rerank }, "%.2f%%"),
+						cell(rs, func(r result) float64 { return 100 * r.RerankRisen }, "%.2f%%"))
+					if prefixOn {
+						fmt.Fprintf(&out, " %s |", cell(rs, func(r result) float64 { return 100 * r.PrefixHit }, "%.1f%%"))
+					}
+					out.WriteString("\n")
+				}
+			}
+		}
 	}
 	t.Log(out.String())
 	if path := os.Getenv("CANDIDATE_SIM_OUT"); path != "" {
